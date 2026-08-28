@@ -360,6 +360,73 @@ class SQLiteEventStore:
         finally:
             connection.close()
 
+    def append_many(
+        self,
+        world_id: str,
+        drafts: Sequence[EventDraft],
+        *,
+        expected_seq: int,
+    ) -> Tuple[WorldEvent, ...]:
+        """Atomically append a pre-validated, ordered event batch.
+
+        This is the commit boundary used by one natural-language turn.  Either
+        every effect is added to the hash chain in order or none of them is.
+        """
+
+        batch = tuple(drafts)
+        if not batch:
+            raise ValueError("append_many requires at least one EventDraft")
+        if any(not isinstance(draft, EventDraft) for draft in batch):
+            raise TypeError("append_many accepts only EventDraft values")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            record = self._get_world(connection, world_id)
+            if record is None:
+                raise WorldNotFound("world not found: %s" % world_id)
+            current_seq = self._head_with_connection(connection, record)
+            if expected_seq != current_seq:
+                raise ConcurrencyConflict(world_id, expected_seq, current_seq)
+            previous = self._event_at_with_connection(connection, world_id, current_seq)
+            if previous is None:
+                raise EventIntegrityError(
+                    "world %s has no event at its reported head %d"
+                    % (world_id, current_seq)
+                )
+
+            committed: List[WorldEvent] = []
+            previous_hash = previous.event_hash
+            for offset, draft in enumerate(batch, start=1):
+                event = self._insert_event(
+                    connection,
+                    world_id,
+                    current_seq + offset,
+                    previous_hash,
+                    draft,
+                )
+                committed.append(event)
+                previous_hash = event.event_hash
+            connection.commit()
+            return tuple(committed)
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            for draft in batch:
+                if draft.proposal_id and self._find_by_proposal_with_connection(
+                    connection, world_id, draft.proposal_id
+                ):
+                    raise DuplicateProposal(
+                        "proposal already committed: %s" % draft.proposal_id
+                    ) from exc
+            raise EventStoreError(
+                "could not append event batch to world %s" % world_id
+            ) from exc
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def load_events(
         self, world_id: str, upto_seq: Optional[int] = None
     ) -> Tuple[WorldEvent, ...]:

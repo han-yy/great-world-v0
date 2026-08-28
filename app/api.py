@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.llm import DeepSeekPolicy, DeepSeekSettings
+from app.llm import DeepSeekIntentInterpreter, DeepSeekPolicy, DeepSeekSettings
 from app.runtime import CONSENT_NOTICE, NOTICE_VERSION, Participant
 from app.service import AuthorizationError, CapacityError, WorldService
 from world.event_store import ConcurrencyConflict, EventStoreError, WorldNotFound
@@ -31,11 +31,17 @@ DEEPSEEK_SETTINGS = DeepSeekSettings.from_env()
 DEEPSEEK_POLICY = (
     DeepSeekPolicy(DEEPSEEK_SETTINGS) if DEEPSEEK_SETTINGS.enabled else None
 )
+DEEPSEEK_INTENT_INTERPRETER = (
+    DeepSeekIntentInterpreter(DEEPSEEK_SETTINGS)
+    if DEEPSEEK_SETTINGS.enabled
+    else None
+)
 
 service = WorldService(
     DATABASE_PATH,
     llm_policy=DEEPSEEK_POLICY,
     llm_agent_ids=(DEEPSEEK_SETTINGS.agent_ids if DEEPSEEK_POLICY else ()),
+    intent_interpreter=DEEPSEEK_INTENT_INTERPRETER,
 )
 
 
@@ -92,6 +98,21 @@ class ActionRequest(BaseModel):
 
     type: Literal["move", "speak", "wish", "explore"]
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class TurnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=1000)
+    observed_seq: int = Field(ge=1)
+    request_id: str = Field(min_length=8, max_length=128)
+
+    @field_validator("text", "request_id")
+    @classmethod
+    def nonblank_turn_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("内容不能为空。")
+        return value.strip()
 
 
 class ForkRequest(BaseModel):
@@ -209,7 +230,7 @@ def world_view(
     return service.observer_view(participant, world_id)
 
 
-@app.post("/api/worlds/{world_id}/actions", status_code=201)
+@app.post("/api/worlds/{world_id}/actions", status_code=201, deprecated=True)
 def submit_action(
     world_id: str,
     request: ActionRequest,
@@ -223,7 +244,7 @@ def submit_action(
     }
 
 
-@app.post("/api/worlds/{world_id}/advance")
+@app.post("/api/worlds/{world_id}/advance", deprecated=True)
 def advance_world(
     world_id: str,
     participant: Participant = Depends(participant_from_token),
@@ -233,6 +254,29 @@ def advance_world(
         "accepted": True,
         "event_ids": [event.event_id for event in result.events],
         "message": result.message,
+    }
+
+
+@app.post("/api/worlds/{world_id}/turns", status_code=201)
+def perform_turn(
+    world_id: str,
+    request: TurnRequest,
+    participant: Participant = Depends(participant_from_token),
+) -> dict[str, Any]:
+    result = service.perform_turn(
+        participant,
+        world_id,
+        request.text,
+        observed_seq=request.observed_seq,
+        request_id=request.request_id,
+    )
+    return {
+        "status": "committed",
+        "player_event_ids": [event.event_id for event in result.player_events],
+        "response_event_ids": [event.event_id for event in result.response_events],
+        "seq": result.view["world"]["seq"],
+        "message": result.message,
+        "view": result.view,
     }
 
 

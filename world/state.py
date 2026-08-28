@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .models import (
+    ACTIVITY_PERFORMED,
     CAPABILITY_UNLOCKED,
     CHILD_GOAL_SELECTED,
     ENTITY_CREATED,
@@ -54,6 +55,7 @@ class WorldState:
         default_factory=lambda: MappingProxyType({})
     )
     utterance_ids: Tuple[str, ...] = ()
+    activity_ids: Tuple[str, ...] = ()
     wish_ids: Tuple[str, ...] = ()
     child_goals: Mapping[str, str] = field(
         default_factory=lambda: MappingProxyType({})
@@ -123,6 +125,7 @@ def reduce_event(state: WorldState, event: WorldEvent) -> WorldState:
 
     entities: Dict[str, Entity] = dict(state.entities)
     utterance_ids = state.utterance_ids
+    activity_ids = state.activity_ids
     wish_ids = state.wish_ids
     child_goals = dict(state.child_goals)
     capabilities = {
@@ -219,6 +222,42 @@ def reduce_event(state: WorldState, event: WorldEvent) -> WorldState:
             },
         )
         utterance_ids = utterance_ids + (utterance_id,)
+
+    elif event.event_type == ACTIVITY_PERFORMED:
+        _check_payload(
+            event,
+            {"activity_id", "actor_id", "description", "target_ids", "location_id"},
+        )
+        activity_id = str(event.payload["activity_id"])
+        actor_id = str(event.payload["actor_id"])
+        actor = entities.get(actor_id)
+        if actor is None or not actor.is_agent:
+            raise StateTransitionError("activity actor is not an agent: %s" % actor_id)
+        if activity_id in entities:
+            raise StateTransitionError("activity already exists: %s" % activity_id)
+        target_ids = tuple(str(value) for value in event.payload["target_ids"])
+        missing_targets = [value for value in target_ids if value not in entities]
+        if missing_targets:
+            raise StateTransitionError(
+                "activity targets do not exist: %s" % missing_targets
+            )
+        location_id = event.payload["location_id"]
+        if location_id is not None and location_id not in entities:
+            raise StateTransitionError(
+                "activity location does not exist: %s" % location_id
+            )
+        entities[activity_id] = Entity(
+            id=activity_id,
+            name=str(event.payload["description"])[:80],
+            kind="activity",
+            location_id=location_id,
+            attributes={
+                "actor_id": actor_id,
+                "description": event.payload["description"],
+                "target_ids": target_ids,
+            },
+        )
+        activity_ids = activity_ids + (activity_id,)
 
     elif event.event_type == WISH_SUBMITTED:
         _check_payload(event, {"wish_id", "submitted_by", "text"})
@@ -373,6 +412,7 @@ def reduce_event(state: WorldState, event: WorldEvent) -> WorldState:
         metadata=_mapping(metadata),
         entities=_mapping(entities),
         utterance_ids=utterance_ids,
+        activity_ids=activity_ids,
         wish_ids=wish_ids,
         child_goals=_mapping(child_goals),
         capabilities=_capability_mapping(capabilities),

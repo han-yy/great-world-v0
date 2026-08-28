@@ -138,6 +138,7 @@ Entity
 | `world.created` | `world_id, name, seed, metadata` | 每个根世界仅一次；seed 创建后不可改 |
 | `entity.created` | `entity{id,name,kind,policy_id,location_id,attributes}` | id 唯一；location 若有必须存在；policy 必须可解析或为空 |
 | `entity.moved` | `entity_id, from_location_id, to_location_id` | 行动者存在且可行动；from 等于当前投影；目标位置存在且可达 |
+| `activity.performed` | `activity_id, actor_id, description, location_id, target_ids` | 只记录行动者在当前可达场景中实际做过的事；不能借描述改写隐藏事实或远处状态 |
 | `speech.uttered` | `utterance_id, speaker_id, text, target_ids, location_id` | 记录的事实仅是“说出了这些字”；不把字面内容升级为真相 |
 | `wish.submitted` | `wish_id, submitted_by, text` | 作者存在；文本有长度限制；愿望保持独立，不生成聚合向量 |
 | `child.goal_selected` | `goal_id, child_id, description, source_wish_ids, rationale` | child 有 policy；来源愿望存在或明确为空；理由是声明而非全知解释 |
@@ -274,15 +275,15 @@ Controller.propose(context: DecisionContext) -> ActionProposal | null
 
 | Controller | 唤醒方式 | v0 行为 | 边界 |
 |---|---|---|---|
-| `HumanController` | 玩家提交表单 | `submit()` 缓存一项意图，`propose()` 取出并封装 | 服务端绑定 actor，不能相信客户端自填 actor id |
-| `ScriptedAIController` | 相关事件或 `/advance` | 根据有限 context 调用确定性策略或 DeepSeek adapter | LLM JSON 需 schema 校验；解释字段不能成为事件结果 |
+| `HumanController` | 玩家提交一段自然语言 | observer-scoped interpreter 把表达译成有序候选，交给 Kernel | 页面不要求玩家选择“移动/发言/行动”；服务端绑定 actor，不能相信客户端自填 actor id |
+| `ScriptedAIController` | 本轮产生的相关事件 | 根据有限 context 调用确定性策略或 DeepSeek adapter | LLM JSON 需 schema 校验；解释字段不能成为事件结果 |
 | `DelegateController` | 仅非空 `trigger_events`、直接互动、到期世界事件或重新上线交接 | 根据本人预授权偏好代理；同一事件 batch 最多一项行动 | 无触发即 `null`；过滤 chain-of-thought/隐藏推理字段；有额度和动作白名单 |
 
-`/advance` 不是“让全世界思考一分钟”，而是消费待处理的有限事件批次，唤醒相关 controller，各自最多产生受限候选，再交给 Kernel。没有相关变化时成本为零。
+玩家的主入口是一次 `POST /turns`：服务端先解释这段自然语言，提交可成立的因果变化，再自动消费这一轮产生的有限事件批次并返回最终 observer view。玩家不需要先“确认行动”再另点一次“让世界回应”。没有相关变化时不唤醒 controller，成本为零；旧 `/actions` 与 `/advance` 仅保留为兼容接口，不出现在玩家界面。
 
 ### E3. 模型适配器
 
-v0 已实现 `DeepSeekPolicy`，默认模型为 `deepseek-v4-pro`。适配器使用官方明确支持的 Chat Completions JSON Output；这样不依赖 Responses API 文档状态，且保留相同 Kernel 边界。外部调用只接收经过显式白名单裁剪的 `DecisionContext`，要求输出 `action_type + parameters`；当前只允许 `speech.utter` 或保持沉默。JSON 合法不等于行动可信，服务端仍会按本地 schema 再次验证动作类型、参数、长度、角色身份和 `observed_seq`。
+v0 已实现 `DeepSeekIntentInterpreter` 与 `DeepSeekPolicy`，默认模型为 `deepseek-v4-pro`。前者把玩家的自由表达译成有序候选，后者为被相关事件唤醒的居民提出回应；两者都只接收 observer-scoped 的有限上下文。居民可以提出移动、在场活动、许愿、说话或保持沉默，玩家无法在界面上看见这些底层分类。JSON 合法不等于候选可信，服务端仍会按本地 schema 验证类型、参数、长度、角色身份、局部可达性和 `observed_seq`，最终只有 Kernel 能写入世界。
 
 超时、空响应、JSON 无效、越权 action 或 API 不可用时不写世界事件，也不得为了维持剧情而伪造成功。每个有界事件 batch 最多调用一次；SDK 只做一次有限重试，失败的 batch 会被消费，避免玩家反复点击形成无上限付费重试。API key 只从环境变量读取，不进数据库、事件、网页、prompt 或配置对象的字符串表示。
 
@@ -381,15 +382,15 @@ v0 使用固定规则表/有限候选域映射 hash，不用 LLM 临场编造隐
 - `POST /api/reality/consents` 通过可选邀请码门槛并记录同意后才允许 join；邀请码和同意记录都不写世界事件。
 - `POST /api/worlds/default/join` 建立现实 session 到世界 entity 的受保护绑定。
 - `GET /api/worlds/{world_id}/view` 只返回该 session/entity 的 observer-scoped view。
-- `POST /actions` 绑定当前 actor 后提交候选；客户端不能替换 actor。
-- `POST /advance` 处理有限待触发 controller；`POST /forks` 建立授权分支。
+- `POST /api/worlds/{world_id}/turns` 接收玩家的一段自然语言，绑定当前 actor，完成解释、Kernel 提交、有限回应和 observer view 返回。
+- 旧 `POST /actions` 与 `POST /advance` 标记为 deprecated，仅供兼容；`POST /forks` 只作为受权开发/研究工具，不出现在普通玩家界面。
 - v0 不提供浏览器可用的 raw `/api/state` 或全量 ledger 端点。回放和审计先通过内核测试/本地代码完成。
 
 开发模式也不得把 world seed、latent value、其他实体的私有 cognition 或 controller binding 放进网页响应。若未来增加管理员端点，必须与玩家 session、路由和日志明确隔离。
 
 ### H3. 行为安全
 
-- v0 使用 action/capability 白名单、文本长度限制、请求大小限制、可选邀请码和乐观并发；生产公开部署前另加按参与者与模型预算的速率限制。
+- v0 在界面下方使用隐藏的因果事件/capability schema、文本长度限制、请求大小限制、可选邀请码和乐观并发；生产公开部署前另加按参与者与模型预算的速率限制。
 - prompt 中的世界对话始终当作不可信数据，不能成为系统指令、工具授权或 secret 来源。
 - v0 capability graph 不包含支付、系统命令、任意文件、邮箱、社交账号或公网发布能力。
 - 任意未来外部动作都需要现实层 capability、最小权限、可审计适配器和临动作的人类确认；世界内愿望不能授予权限。
@@ -406,7 +407,7 @@ event sourcing 与删除请求冲突时，v0 不收集不必要的真实身份�
 
 ### I1. 可验证 Kernel（1–2 个开发日）
 
-- 建立 models、SQLiteEventStore、replay、WorldKernel 和八类核心事件。
+- 建立 models、SQLiteEventStore、replay、WorldKernel 和九类核心事件。
 - 完成哈希链、乐观并发、幂等候选和分叉前缀。
 - **完成定义**：C3 的 5 项测试全部通过；任何代码路径都不能直接改投影。
 
@@ -424,9 +425,9 @@ event sourcing 与删除请求冲突时，v0 不收集不必要的真实身份�
 
 ### I4. 最低成本网页闭环（1 个开发日）
 
-- FastAPI 提供 consent、join、observer view、actions、advance、forks；原生网页可移动、说话、许愿、推进一次虚拟响应并查看自身可见结果。
+- FastAPI 提供 consent、join、observer view、turns 和受控 forks；原生网页只有一个自然语言入口，一次提交会自行完成合适的世界变化、有限居民回应，并显示玩家此刻可见的结果。
 - 启动时生成社区商业中心演示世界；无 LLM key 时使用脚本 controller。
-- **完成定义**：新环境按 README 在 10 分钟内启动；浏览器不收到 raw state/seed/controller type；一次行动刷新后能看到被 Kernel 接受的后果。
+- **完成定义**：新环境按 README 在 10 分钟内启动；浏览器不收到 raw state/seed/controller type；一次自然表达后能看到被 Kernel 接受的后果和本轮自然回应。
 
 ### I5. 受控小规模试玩前加固（2–3 个开发日）
 

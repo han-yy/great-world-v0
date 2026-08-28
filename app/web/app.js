@@ -14,12 +14,21 @@ async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers });
   let body = {};
   try { body = await response.json(); } catch (_) { /* no response body */ }
-  if (!response.ok) throw new Error(body.detail || body.message || `请求失败（${response.status}）`);
+  if (!response.ok) {
+    const problem = new Error(body.detail || body.message || `请求失败（${response.status}）`);
+    problem.code = body.code;
+    throw problem;
+  }
   return body;
 }
 
 function text(element, value) {
   element.textContent = value ?? "";
+}
+
+function newRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 async function loadConsentNotice() {
@@ -45,7 +54,6 @@ async function enterWorld() {
   state.worldId = joined.world_id;
   localStorage.setItem("great_world_id", state.worldId);
   $("#world-app").hidden = false;
-  $("#fork-button").disabled = false;
   await refreshView();
 }
 
@@ -58,25 +66,23 @@ async function refreshView() {
 
 function render(view) {
   text($("#world-name"), view.world.name);
-  text($("#world-tick"), view.world.tick);
   text($("#self-name"), view.self.name);
-  text($("#self-location"), `此刻在：${view.self.location_name || "你无法确定的地方"}`);
+  text($("#self-location"), view.self.location_name || "你一时说不清这是哪里");
   text($("#child-description"), view.child.description);
-  text($("#child-goal"), view.child.goal ? `ta 选择了：${view.child.goal}` : "ta 还没有选择目标。");
-
-  const chips = $("#child-capabilities");
-  chips.replaceChildren();
-  for (const capability of view.child.capabilities) {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    text(chip, capability);
-    chips.append(chip);
-  }
+  const abilityText = view.child.capabilities.length
+    ? `ta 现在已经能${view.child.capabilities.join("、")}。`
+    : "ta 还在学习怎样感知这里。";
+  text($("#child-capabilities"), abilityText);
+  text(
+    $("#child-goal"),
+    view.child.goal
+      ? `ta 最近决定先做这件事：${view.child.goal}`
+      : "ta 暂时没有决定接下来专心做什么。",
+  );
 
   renderLocations(view.locations, view.self.location_id);
   renderTimeline(view.experiences);
   renderWishes(view.wishes);
-  populateActionTargets(view.locations, view.visible_entities);
 }
 
 function renderLocations(locations, currentId) {
@@ -88,7 +94,7 @@ function renderLocations(locations, currentId) {
     const title = document.createElement("h3");
     text(title, location.name);
     const description = document.createElement("p");
-    text(description, location.description || "这里的细节还没有进入你的经验。 ");
+    text(description, location.description || "这里很安静。");
     card.append(title, description);
     if (location.id === currentId) {
       const marker = document.createElement("span");
@@ -115,14 +121,13 @@ function renderTimeline(experiences) {
   if (!experiences.length) {
     const empty = document.createElement("li");
     empty.className = "empty-state";
-    text(empty, "你刚刚来到这里。先做一件事。");
+    text(empty, "你刚来到这里，周围还很安静。");
     list.append(empty);
     return;
   }
   const template = $("#timeline-item-template");
   for (const experience of [...experiences].reverse()) {
     const item = template.content.cloneNode(true);
-    text(item.querySelector(".timeline-tick"), `T.${experience.tick}`);
     text(item.querySelector(".timeline-title"), experience.summary);
     text(item.querySelector(".timeline-detail"), experience.detail || "");
     list.append(item);
@@ -135,7 +140,7 @@ function renderWishes(wishes) {
   if (!wishes.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    text(empty, "水面平静，还没有愿望。");
+    text(empty, "今天还没有人在这里留下愿望。");
     pool.append(empty);
     return;
   }
@@ -147,87 +152,42 @@ function renderWishes(wishes) {
   }
 }
 
-function populateActionTargets(locations, entities) {
-  const destination = $("#move-destination");
-  const previousDestination = destination.value;
-  destination.replaceChildren();
-  for (const location of locations) {
-    const option = new Option(location.name, location.id);
-    destination.add(option);
-  }
-  if ([...destination.options].some((o) => o.value === previousDestination)) destination.value = previousDestination;
-
-  const target = $("#explore-target");
-  const previousTarget = target.value;
-  target.replaceChildren();
-  for (const entity of entities) target.add(new Option(entity.name, entity.id));
-  if ([...target.options].some((o) => o.value === previousTarget)) target.value = previousTarget;
-}
-
-function actionPayload(kind) {
-  if (kind === "move") return { destination_id: $("#move-destination").value };
-  if (kind === "speak") return { text: $("#speech-text").value.trim() };
-  if (kind === "wish") return { text: $("#wish-text").value.trim() };
-  if (kind === "explore") return { target_id: $("#explore-target").value, aspect: $("#explore-aspect").value };
-  return {};
-}
-
-async function performAction(event) {
+async function submitMoment(event) {
   event.preventDefault();
-  const kind = $("#action-kind").value;
-  const status = $("#action-status");
-  status.classList.remove("error");
-  text(status, "世界正在核对这项行动…");
-  try {
-    await api(`/api/worlds/${encodeURIComponent(state.worldId)}/actions`, {
-      method: "POST",
-      body: JSON.stringify({ type: kind, payload: actionPayload(kind) }),
-    });
-    $("#speech-text").value = "";
-    $("#wish-text").value = "";
-    text(status, "行动已经成为历史的一部分。");
-    await refreshView();
-  } catch (error) {
-    status.classList.add("error");
-    text(status, error.message);
-  }
-}
-
-function updateActionFields() {
-  const kind = $("#action-kind").value;
-  for (const name of ["move", "speak", "wish", "explore"]) {
-    $(`#${name}-fields`).hidden = kind !== name;
-  }
-}
-
-async function advanceWorld() {
-  const status = $("#action-status");
-  status.classList.remove("error");
-  text(status, "等待世界中的行动者回应…");
-  try {
-    const result = await api(`/api/worlds/${encodeURIComponent(state.worldId)}/advance`, { method: "POST", body: "{}" });
-    text(status, result.message || "世界回应了一次。");
-    await refreshView();
-  } catch (error) {
-    status.classList.add("error");
-    text(status, error.message);
-  }
-}
-
-async function forkWorld() {
   if (!state.view) return;
-  const confirmed = window.confirm(`从时刻 ${state.view.world.tick} 创建一个可独立发展的分支？原世界不会改变。`);
-  if (!confirmed) return;
+  const input = $("#moment-input");
+  const submit = $("#moment-submit");
+  const status = $("#moment-status");
+  const intent = input.value.trim();
+  if (!intent) return;
+
+  status.classList.remove("error");
+  submit.disabled = true;
+  text(status, "请稍候，事情正在发生……");
   try {
-    const result = await api(`/api/worlds/${encodeURIComponent(state.worldId)}/forks`, {
+    const result = await api(`/api/worlds/${encodeURIComponent(state.worldId)}/turns`, {
       method: "POST",
-      body: JSON.stringify({ at_seq: state.view.world.seq }),
+      body: JSON.stringify({
+        text: intent,
+        observed_seq: state.view.world.seq,
+        request_id: newRequestId(),
+      }),
     });
-    state.worldId = result.world_id;
-    localStorage.setItem("great_world_id", state.worldId);
-    await refreshView();
-  } catch (error) {
-    text($("#action-status"), error.message);
+    input.value = "";
+    state.view = result.view;
+    render(result.view);
+    text(status, result.message || "这里继续生活了下去。");
+  } catch (problem) {
+    status.classList.add("error");
+    if (problem.code === "world_advanced") {
+      await refreshView();
+      text(status, "刚才这里又发生了些事。内容还留着，你可以再继续一次。");
+    } else {
+      text(status, problem.message);
+    }
+  } finally {
+    submit.disabled = false;
+    input.focus();
   }
 }
 
@@ -259,12 +219,14 @@ async function submitConsent(event) {
 async function init() {
   await loadConsentNotice();
   $("#consent-form").addEventListener("submit", submitConsent);
-  $("#action-form").addEventListener("submit", performAction);
-  $("#action-kind").addEventListener("change", updateActionFields);
-  $("#advance-button").addEventListener("click", advanceWorld);
+  $("#moment-form").addEventListener("submit", submitMoment);
+  $("#moment-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      $("#moment-form").requestSubmit();
+    }
+  });
   $("#refresh-button").addEventListener("click", refreshView);
-  $("#fork-button").addEventListener("click", forkWorld);
-  updateActionFields();
 
   if (!state.token) {
     $("#consent-dialog").showModal();
@@ -282,5 +244,5 @@ async function init() {
 }
 
 init().catch((error) => {
-  document.body.textContent = `世界入口暂时无法打开：${error.message}`;
+  document.body.textContent = `入口暂时打不开：${error.message}`;
 });

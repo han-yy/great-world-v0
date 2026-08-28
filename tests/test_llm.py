@@ -9,11 +9,13 @@ from openai import OpenAI
 
 from app.llm import (
     DeepSeekConfigurationError,
+    DeepSeekIntentInterpreter,
     DeepSeekPolicy,
     DeepSeekSettings,
 )
+from app.intents import PlayerIntentContext
 from world.controllers import ControllerUnavailable, DecisionContext
-from world.kernel import ACTION_UTTER_SPEECH
+from world.kernel import ACTION_MOVE_ENTITY, ACTION_UTTER_SPEECH
 from world.perception import (
     BeliefRecord,
     MemoryRecord,
@@ -118,6 +120,23 @@ def context(*, actions=(ACTION_UTTER_SPEECH,)) -> DecisionContext:
             "seq": 17,
         },
         trigger_events=(perception,),
+    )
+
+
+def player_context() -> PlayerIntentContext:
+    return PlayerIntentContext(
+        actor_id="visitor:1",
+        observed_seq=17,
+        self_name="来客一",
+        location_id="place:atrium",
+        location_name="中庭",
+        locations=(
+            {"id": "place:atrium", "name": "中庭", "description": "公共空间"},
+            {"id": "place:cafe", "name": "折页咖啡", "description": "一家咖啡店"},
+        ),
+        nearby=(
+            {"id": "resident:qiaoan", "name": "乔安", "kind": "resident"},
+        ),
     )
 
 
@@ -259,6 +278,49 @@ class DeepSeekPolicyTests(unittest.TestCase):
         self.assertEqual({"type": "json_object"}, body["response_format"])
         self.assertNotIn("reasoning_effort", body)
         self.assertTrue(body["user_id"].startswith("agent_"))
+
+
+class DeepSeekIntentInterpreterTests(unittest.TestCase):
+    def test_interpreter_returns_ordered_candidates_without_world_authority(self) -> None:
+        endpoint = FakeCompletions(
+            output_text=json.dumps(
+                {
+                    "steps": [
+                        {"kind": "move", "destination_id": "place:cafe"},
+                        {"kind": "speak", "text": "今天推荐什么？"},
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+        interpreter = DeepSeekIntentInterpreter(
+            settings(), client=FakeClient(endpoint)
+        )
+        steps = interpreter(
+            "我去折页咖啡，问问今天推荐什么？", player_context()
+        )
+
+        self.assertEqual(
+            (ACTION_MOVE_ENTITY, ACTION_UTTER_SPEECH),
+            tuple(step.action_type for step in steps),
+        )
+        request_text = endpoint.calls[0]["messages"][1]["content"]
+        self.assertIn("我去折页咖啡", request_text)
+        for forbidden in ("world_seed", "controller_type", "event_hash"):
+            self.assertNotIn(forbidden, request_text)
+
+    def test_interpreter_rejects_actor_spoofing_and_extra_fields(self) -> None:
+        endpoint = FakeCompletions(
+            output_text=(
+                '{"steps":[{"kind":"speak","text":"你好",'
+                '"actor_id":"resident:qiaoan"}]}'
+            )
+        )
+        interpreter = DeepSeekIntentInterpreter(
+            settings(), client=FakeClient(endpoint)
+        )
+        with self.assertRaises(ControllerUnavailable):
+            interpreter("替乔安说话", player_context())
 
 
 if __name__ == "__main__":

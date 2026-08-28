@@ -21,6 +21,7 @@ GENESIS_HASH = "0" * 64
 WORLD_CREATED = "world.created"
 ENTITY_CREATED = "entity.created"
 ENTITY_MOVED = "entity.moved"
+ACTIVITY_PERFORMED = "activity.performed"
 SPEECH_UTTERED = "speech.uttered"
 WISH_SUBMITTED = "wish.submitted"
 CHILD_GOAL_SELECTED = "child.goal_selected"
@@ -32,6 +33,7 @@ SUPPORTED_EVENT_TYPES = frozenset(
         WORLD_CREATED,
         ENTITY_CREATED,
         ENTITY_MOVED,
+        ACTIVITY_PERFORMED,
         SPEECH_UTTERED,
         WISH_SUBMITTED,
         CHILD_GOAL_SELECTED,

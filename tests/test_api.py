@@ -151,6 +151,53 @@ class ApiTests(unittest.TestCase):
         updated = self.client.get(f"/api/worlds/{world_id}/view", headers=headers).json()
         self.assertIn("我听见了", json.dumps(updated["experiences"], ensure_ascii=False))
 
+    def test_one_natural_language_turn_moves_speaks_and_gets_a_response(self) -> None:
+        world_id, _, headers = self.consent_and_join("甲")
+        before = self.client.get(
+            f"/api/worlds/{world_id}/view", headers=headers
+        ).json()
+
+        response = self.client.post(
+            f"/api/worlds/{world_id}/turns",
+            headers=headers,
+            json={
+                "text": "我去折页咖啡，问问今天推荐什么？",
+                "observed_seq": before["world"]["seq"],
+                "request_id": "turn-natural-0001",
+            },
+        )
+
+        self.assertEqual(201, response.status_code, response.text)
+        result = response.json()
+        self.assertEqual(2, len(result["player_event_ids"]))
+        self.assertEqual(1, len(result["response_event_ids"]))
+        self.assertEqual("place:cafe", result["view"]["self"]["location_id"])
+        rendered = json.dumps(result["view"]["experiences"], ensure_ascii=False)
+        self.assertIn("今天推荐什么", rendered)
+        self.assertIn("我听见了", rendered)
+
+    def test_free_form_activity_is_committed_without_an_action_category(self) -> None:
+        world_id, _, headers = self.consent_and_join("甲")
+        before = self.client.get(
+            f"/api/worlds/{world_id}/view", headers=headers
+        ).json()
+        response = self.client.post(
+            f"/api/worlds/{world_id}/turns",
+            headers=headers,
+            json={
+                "text": "我在窗边坐下，写下一段今天的观察。",
+                "observed_seq": before["world"]["seq"],
+                "request_id": "turn-natural-0002",
+            },
+        )
+        self.assertEqual(201, response.status_code, response.text)
+        result = response.json()
+        self.assertEqual(1, len(result["player_event_ids"]))
+        self.assertIn(
+            "我在窗边坐下，写下一段今天的观察。",
+            json.dumps(result["view"]["experiences"], ensure_ascii=False),
+        )
+
     def test_fork_diverges_without_changing_parent(self) -> None:
         world_id, _, headers = self.consent_and_join("甲")
         parent = self.client.get(f"/api/worlds/{world_id}/view", headers=headers).json()

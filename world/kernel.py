@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 from .event_store import SQLiteEventStore
 from .models import (
+    ACTIVITY_PERFORMED,
     CAPABILITY_UNLOCKED,
     CHILD_GOAL_SELECTED,
     ENTITY_CREATED,
@@ -23,11 +24,12 @@ from .models import (
     new_id,
     thaw,
 )
-from .state import WorldState, replay
+from .state import WorldState, reduce_event, replay
 
 
 ACTION_CREATE_ENTITY = "entity.create"
 ACTION_MOVE_ENTITY = "entity.move"
+ACTION_PERFORM_ACTIVITY = "activity.perform"
 ACTION_UTTER_SPEECH = "speech.utter"
 ACTION_SUBMIT_WISH = "wish.submit"
 ACTION_SELECT_CHILD_GOAL = "child.select_goal"
@@ -38,6 +40,7 @@ SUPPORTED_ACTION_TYPES = frozenset(
     {
         ACTION_CREATE_ENTITY,
         ACTION_MOVE_ENTITY,
+        ACTION_PERFORM_ACTIVITY,
         ACTION_UTTER_SPEECH,
         ACTION_SUBMIT_WISH,
         ACTION_SELECT_CHILD_GOAL,
@@ -49,6 +52,7 @@ SUPPORTED_ACTION_TYPES = frozenset(
 ACTION_EVENT_TYPES = {
     ACTION_CREATE_ENTITY: ENTITY_CREATED,
     ACTION_MOVE_ENTITY: ENTITY_MOVED,
+    ACTION_PERFORM_ACTIVITY: ACTIVITY_PERFORMED,
     ACTION_UTTER_SPEECH: SPEECH_UTTERED,
     ACTION_SUBMIT_WISH: WISH_SUBMITTED,
     ACTION_SELECT_CHILD_GOAL: CHILD_GOAL_SELECTED,
@@ -139,6 +143,71 @@ class WorldKernel:
         )
 
     submit_proposal = submit
+
+    def submit_many(
+        self,
+        world_id: str,
+        proposals: Sequence[ActionProposal],
+        *,
+        expected_seq: Optional[int] = None,
+    ) -> Tuple[WorldEvent, ...]:
+        """Validate a causal plan against intermediate states, then commit atomically."""
+
+        batch = tuple(proposals)
+        if not batch:
+            return ()
+        if any(not isinstance(proposal, ActionProposal) for proposal in batch):
+            raise TypeError("submit_many accepts only ActionProposal values")
+        if any(proposal.actor_id is None for proposal in batch):
+            raise ProposalRejected("ordinary proposals require actor_id")
+        proposal_ids = [proposal.proposal_id for proposal in batch]
+        if len(proposal_ids) != len(set(proposal_ids)):
+            raise ProposalRejected("a proposal batch contains duplicate proposal_id values")
+        for proposal_id in proposal_ids:
+            if self.store.find_by_proposal(world_id, proposal_id) is not None:
+                raise ProposalRejected(
+                    "a proposal in this causal plan was already committed"
+                )
+
+        state = self.get_state(world_id)
+        commit_seq = expected_seq
+        if commit_seq is None:
+            observed = batch[0].observed_seq
+            commit_seq = state.seq if observed is None else observed
+        if commit_seq != state.seq:
+            from .event_store import ConcurrencyConflict
+
+            raise ConcurrencyConflict(world_id, commit_seq, state.seq)
+
+        drafts: list[EventDraft] = []
+        preview_hash = "0" * 64
+        for index, proposal in enumerate(batch, start=1):
+            if proposal.observed_seq is not None and proposal.observed_seq != state.seq:
+                raise ProposalRejected(
+                    "proposal observed_seq does not match its causal predecessor"
+                )
+            draft = self.validate_and_translate(
+                world_id,
+                proposal,
+                state=state,
+                system_authority=False,
+            )
+            drafts.append(draft)
+            preview = WorldEvent(
+                world_id=world_id,
+                seq=state.seq + 1,
+                event_id=f"preview_{proposal.proposal_id}_{index}",
+                event_type=draft.event_type,
+                payload=draft.payload,
+                occurred_at=proposal.submitted_at,
+                actor_id=draft.actor_id,
+                proposal_id=draft.proposal_id,
+                prev_hash=preview_hash,
+                event_hash=preview_hash,
+            )
+            state = reduce_event(state, preview)
+
+        return self.store.append_many(world_id, drafts, expected_seq=commit_seq)
 
     def submit_system(
         self,
@@ -342,6 +411,7 @@ class WorldKernel:
         translators = {
             ACTION_CREATE_ENTITY: self._translate_create_entity,
             ACTION_MOVE_ENTITY: self._translate_move_entity,
+            ACTION_PERFORM_ACTIVITY: self._translate_activity,
             ACTION_UTTER_SPEECH: self._translate_speech,
             ACTION_SUBMIT_WISH: self._translate_wish,
             ACTION_SELECT_CHILD_GOAL: self._translate_child_goal,
@@ -578,6 +648,54 @@ class WorldKernel:
             "utterance_id": utterance_id,
             "speaker_id": actor.id,
             "text": text,
+            "target_ids": target_ids,
+            "location_id": actor.location_id,
+        }
+
+    def _translate_activity(
+        self,
+        state: WorldState,
+        proposal: ActionProposal,
+        system_authority: bool,
+    ) -> Mapping[str, Any]:
+        if system_authority:
+            raise ProposalRejected("the world kernel cannot act as a resident")
+        params = self._params(
+            proposal,
+            required={"description"},
+            optional={"target_ids", "activity_id"},
+        )
+        actor = self._require_actor(state, proposal.actor_id)
+        description = self._text(params["description"], "description", 2000)
+        target_ids = self._string_tuple(
+            params.get("target_ids", ()), "target_ids", 20
+        )
+        for target_id in target_ids:
+            target = state.entities.get(target_id)
+            if target is None:
+                raise ProposalRejected("activity target does not exist: %s" % target_id)
+            is_here = (
+                target.id == actor.location_id
+                or target.location_id == actor.location_id
+                or target.id == actor.id
+            )
+            if not is_here:
+                raise ProposalRejected(
+                    "activity target is outside the actor's observable location: %s"
+                    % target_id
+                )
+        default_id = "activity_" + hashlib.sha256(
+            proposal.proposal_id.encode("utf-8")
+        ).hexdigest()[:24]
+        activity_id = self._text(
+            params.get("activity_id", default_id), "activity_id", 256
+        )
+        if activity_id in state.entities:
+            raise ProposalRejected("activity id already exists: %s" % activity_id)
+        return {
+            "activity_id": activity_id,
+            "actor_id": actor.id,
+            "description": description,
             "target_ids": target_ids,
             "location_id": actor.location_id,
         }

@@ -7,6 +7,7 @@ import unittest
 from world import (
     ACTION_FREEZE_LATENT_FACT,
     ACTION_MOVE_ENTITY,
+    ACTION_PERFORM_ACTIVITY,
     ACTION_SELECT_CHILD_GOAL,
     ACTION_SUBMIT_WISH,
     ACTION_UNLOCK_CAPABILITY,
@@ -80,6 +81,18 @@ class KernelTestCase(unittest.TestCase):
                 {"entity_id": "player-1", "to_location_id": "cafe"},
             ),
         )
+        activity_event = self.kernel.submit(
+            "mall",
+            ActionProposal(
+                ACTION_PERFORM_ACTIVITY,
+                "player-1",
+                {
+                    "activity_id": "activity-1",
+                    "description": "Sits by the cafe window and opens a notebook.",
+                    "target_ids": ["cafe"],
+                },
+            ),
+        )
         speech_event = self.kernel.submit(
             "mall",
             ActionProposal(
@@ -144,6 +157,11 @@ class KernelTestCase(unittest.TestCase):
 
         state = self.kernel.get_state("mall")
         self.assertEqual("cafe", state.entity("player-1").location_id)
+        self.assertEqual(("activity-1",), state.activity_ids)
+        self.assertEqual(
+            "Sits by the cafe window and opens a notebook.",
+            state.entity("activity-1").attributes["description"],
+        )
         self.assertEqual("Hello, world.", state.entity("utterance-1").attributes["text"])
         self.assertEqual(("wish-1",), state.wish_ids)
         self.assertEqual("goal-1", state.active_goal_for("child").id)
@@ -154,7 +172,8 @@ class KernelTestCase(unittest.TestCase):
         )
         self.assertEqual(self.store.head("mall"), state.seq)
         self.assertTrue(self.store.verify_chain("mall"))
-        self.assertEqual(move_event.seq + 1, speech_event.seq)
+        self.assertEqual(move_event.seq + 1, activity_event.seq)
+        self.assertEqual(activity_event.seq + 1, speech_event.seq)
         self.assertEqual(wish_event.seq + 1, goal_event.seq)
         self.assertEqual(goal_event.seq + 1, capability_event.seq)
 
@@ -166,6 +185,55 @@ class KernelTestCase(unittest.TestCase):
                 scope="mall.infrastructure",
                 exploration_context_hash="c" * 64,
             )
+
+    def test_multi_step_plan_is_validated_then_appended_atomically(self):
+        self.bootstrap()
+        observed = self.store.head("mall")
+        committed = self.kernel.submit_many(
+            "mall",
+            (
+                ActionProposal(
+                    ACTION_MOVE_ENTITY,
+                    "player-1",
+                    {"entity_id": "player-1", "to_location_id": "cafe"},
+                    observed_seq=observed,
+                ),
+                ActionProposal(
+                    ACTION_UTTER_SPEECH,
+                    "player-1",
+                    {"text": "What is good today?"},
+                    observed_seq=observed + 1,
+                ),
+            ),
+            expected_seq=observed,
+        )
+        self.assertEqual(2, len(committed))
+        self.assertEqual("cafe", committed[1].payload["location_id"])
+        self.assertEqual("cafe", self.kernel.state("mall").entity("player-1").location_id)
+        self.assertTrue(self.store.verify_chain("mall"))
+
+        head = self.store.head("mall")
+        with self.assertRaises(ProposalRejected):
+            self.kernel.submit_many(
+                "mall",
+                (
+                    ActionProposal(
+                        ACTION_MOVE_ENTITY,
+                        "player-1",
+                        {"entity_id": "player-1", "to_location_id": "atrium"},
+                        observed_seq=head,
+                    ),
+                    ActionProposal(
+                        ACTION_UTTER_SPEECH,
+                        "player-1",
+                        {"text": "bad", "state": "rewrite"},
+                        observed_seq=head + 1,
+                    ),
+                ),
+                expected_seq=head,
+            )
+        self.assertEqual(head, self.store.head("mall"))
+        self.assertEqual("cafe", self.kernel.state("mall").entity("player-1").location_id)
 
     def test_proposal_cannot_patch_state_or_impersonate_non_agent(self):
         self.bootstrap()

@@ -7,15 +7,17 @@
 调用链固定为：
 
 ```text
-角色获得新体验
-  -> WorldService 构造该角色专属的 DecisionContext
-  -> DeepSeekPolicy 只上传裁剪后的观察 / 信念 / 记忆
-  -> deepseek-v4-pro 返回一项结构化行动候选或保持沉默
-  -> 服务端绑定角色身份并再次校验
+参与者写下自然语言
+  -> 规则解释器先处理清楚的日常表达
+  -> 必要时 DeepSeekIntentInterpreter 只接收原文和参与者可观察上下文
+  -> 服务端把有限步骤绑定到当前角色并再次校验
   -> WorldKernel 接受后才追加不可变事件
+  -> perception / belief / memory 管道派生各自体验
+  -> 收到相关新体验的居民按需提出一次候选
+  -> WorldKernel 再次裁决，网页在同一次请求中看到结果
 ```
 
-模型不能读取完整世界账本、world seed、隐藏事实或其他角色的私人 cognition，也不能直接写 SQLite。主要代码入口是 `app/llm.py`；注入发生在 `app/api.py`；事件批次与 Kernel 提交发生在 `app/service.py`。
+模型不能读取完整世界账本、world seed、隐藏事实或其他角色的私人 cognition，也不能直接写 SQLite。规则入口是 `app/intents.py`，DeepSeek 入口是 `app/llm.py`，注入发生在 `app/api.py`，单次 `/turns` 编排与 Kernel 提交发生在 `app/service.py`。
 
 默认仅 `resident:linqiao` 使用 DeepSeek。需要扩大到更多初始居民时，把 `DEEPSEEK_AGENT_IDS` 改为逗号分隔的列表：
 
@@ -36,7 +38,7 @@ uv sync --extra dev --python 3.12
 uv run --env-file .env uvicorn app.api:app --reload
 ```
 
-4. 进入世界后移动到咖啡店，对林乔说话，再点“让世界回应一次”。只有收到新体验时才产生一次模型请求。
+4. 进入世界后直接写“我去折页咖啡，问问林乔今天推荐什么”。一次提交会完成移动、发言与相关回应；不再需要第二个推进按钮。
 
 `.env` 已被 `.gitignore` 排除。若模型超时、返回空内容、无效 JSON 或越权动作，该批次不会写入伪造事件。
 
@@ -70,7 +72,7 @@ DEEPSEEK_MAX_OUTPUT_TOKENS=300
 - 保持一个 replica、一个 worker；SQLite、进程内推进锁和单卷都依赖单写者部署。
 - 设置一个难猜的邀请码，只发给受邀测试者；它保护新参与者入口，但不替代生产级账号系统和限流。
 - DeepSeek key 只存在于本地 `.env` 或 Railway Variables；默认只允许发往 `api.deepseek.com`，自建网关必须显式开启并自行承担数据边界责任。
-- 启用外部模型后，首次进入会展示新版知情说明：角色自己的有限上下文可能发送给模型供应商。
+- 启用外部模型后，首次进入会展示新版知情说明：玩家提交的自然语言原文和角色自己的有限上下文可能发送给模型供应商。
 - 备份卷中的 `great_world.sqlite3` 及其 WAL 相关文件；备份前停止写入或使用 SQLite 在线备份机制。
 若要公开招募而非小范围邀请，先完成真实身份验证、请求/模型预算限流、封禁举报、退出删除与数据保留政策。
 

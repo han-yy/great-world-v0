@@ -11,6 +11,14 @@ from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.epistemic_store import EpistemicStore
+from app.intents import (
+    ACTION_EXPLORE,
+    IntentInterpreter,
+    IntentStep,
+    PlayerIntentContext,
+    RuleBasedIntentInterpreter,
+    free_activity,
+)
 from app.runtime import Participant, RuntimeStore
 from app.scenario import (
     ALL_ENTITIES,
@@ -34,6 +42,7 @@ from world.controllers import (
 )
 from world.event_store import SQLiteEventStore, WorldNotFound
 from world.kernel import (
+    ACTION_PERFORM_ACTIVITY,
     ACTION_FREEZE_LATENT_FACT,
     ACTION_MOVE_ENTITY,
     ACTION_SELECT_CHILD_GOAL,
@@ -44,6 +53,7 @@ from world.kernel import (
 )
 from world.latent import ExplorationContext, LatentFact, LatentRealityResolver
 from world.models import (
+    ACTIVITY_PERFORMED,
     CAPABILITY_UNLOCKED,
     CHILD_GOAL_SELECTED,
     ENTITY_MOVED,
@@ -53,6 +63,7 @@ from world.models import (
     ActionProposal,
     Entity,
     WorldEvent,
+    canonical_json,
     new_id,
 )
 from world.perception import (
@@ -62,7 +73,7 @@ from world.perception import (
     PerceptionRecord,
     ProvenanceRef,
 )
-from world.state import WorldState
+from world.state import WorldState, reduce_event
 
 
 class AuthorizationError(RuntimeError):
@@ -80,6 +91,14 @@ logger = logging.getLogger(__name__)
 class AdvanceResult:
     events: tuple[WorldEvent, ...]
     message: str
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    player_events: tuple[WorldEvent, ...]
+    response_events: tuple[WorldEvent, ...]
+    message: str
+    view: Mapping[str, Any]
 
 
 def _clean_text(value: Any, field_name: str, *, maximum: int = 500) -> str:
@@ -106,6 +125,7 @@ class WorldService:
         *,
         llm_policy: Policy | None = None,
         llm_agent_ids: Iterable[str] = (),
+        intent_interpreter: IntentInterpreter | None = None,
     ):
         self.database_path = Path(database_path)
         self.events = SQLiteEventStore(self.database_path)
@@ -114,6 +134,8 @@ class WorldService:
         self.epistemic = EpistemicStore(self.database_path)
         self.pipeline = PerceptionBeliefMemoryPipeline()
         self.llm_policy = llm_policy
+        self.intent_interpreter = intent_interpreter
+        self.rule_intent_interpreter = RuleBasedIntentInterpreter()
         self.llm_agent_ids = frozenset(str(item) for item in llm_agent_ids)
         self._advance_lock = Lock()
         invalid_llm_agents = {
@@ -305,6 +327,236 @@ class WorldService:
         state_after = self.kernel.state(world_id)
         self._derive_cognition(world_id, event, state_before, state_after)
         return (event,)
+
+    def _player_intent_context(
+        self, state: WorldState, actor_id: str
+    ) -> PlayerIntentContext:
+        actor = state.entity(actor_id)
+        location = state.entities.get(actor.location_id or "")
+        locations = tuple(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "description": str(entity.attributes.get("description", "")),
+            }
+            for entity in state.entities.values()
+            if entity.kind == "place"
+        )
+        nearby = tuple(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "description": str(entity.attributes.get("description", "")),
+            }
+            for entity in state.entities.values()
+            if (
+                entity.id == actor.location_id
+                or entity.location_id == actor.location_id
+                or entity.id == actor.id
+            )
+            and entity.kind
+            not in {
+                "activity",
+                "capability",
+                "goal",
+                "latent_fact",
+                "utterance",
+                "wish",
+            }
+        )
+        return PlayerIntentContext(
+            actor_id=actor.id,
+            observed_seq=state.seq,
+            self_name=actor.name,
+            location_id=actor.location_id,
+            location_name=location.name if location else None,
+            locations=locations,
+            nearby=nearby,
+        )
+
+    def _interpret_turn(
+        self, text: str, context: PlayerIntentContext
+    ) -> tuple[IntentStep, ...]:
+        local = self.rule_intent_interpreter(text, context)
+        if local:
+            return local
+        if self.intent_interpreter is not None:
+            try:
+                interpreted = self.intent_interpreter(text, context)
+                if interpreted:
+                    return tuple(interpreted)
+            except ControllerUnavailable as exc:
+                logger.warning("intent interpreter unavailable: %s", exc)
+        return free_activity(text)
+
+    def _proposal_for_turn_step(
+        self,
+        *,
+        world_id: str,
+        actor_id: str,
+        step: IntentStep,
+        observed_seq: int,
+        request_id: str,
+        index: int,
+    ) -> ActionProposal:
+        parameters = dict(step.parameters)
+        if step.action_type == ACTION_MOVE_ENTITY:
+            _require_exact_keys(parameters, {"to_location_id"})
+            parameters = {
+                "entity_id": actor_id,
+                "to_location_id": _clean_text(
+                    parameters.get("to_location_id"), "地点", maximum=256
+                ),
+            }
+        elif step.action_type == ACTION_UTTER_SPEECH:
+            _require_exact_keys(parameters, {"text"})
+            parameters = {"text": _clean_text(parameters.get("text"), "说话内容")}
+        elif step.action_type == ACTION_SUBMIT_WISH:
+            _require_exact_keys(parameters, {"text"})
+            parameters = {"text": _clean_text(parameters.get("text"), "愿望")}
+        elif step.action_type == ACTION_PERFORM_ACTIVITY:
+            _require_exact_keys(parameters, {"description", "target_ids"})
+            target_ids = parameters.get("target_ids", ())
+            if not isinstance(target_ids, (list, tuple)):
+                raise ValueError("活动对象必须是列表。")
+            parameters = {
+                "description": _clean_text(
+                    parameters.get("description"), "想做的事", maximum=500
+                ),
+                "target_ids": list(target_ids),
+            }
+        else:
+            raise ValueError("这个意图还没有可验证的世界语义。")
+
+        identity = canonical_json(
+            {
+                "world_id": world_id,
+                "actor_id": actor_id,
+                "request_id": request_id,
+                "index": index,
+                "action_type": step.action_type,
+                "parameters": parameters,
+            }
+        )
+        proposal_id = "turn_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        return ActionProposal(
+            action_type=step.action_type,
+            actor_id=actor_id,
+            parameters=parameters,
+            proposal_id=proposal_id,
+            observed_seq=observed_seq,
+        )
+
+    def _commit_kernel_steps(
+        self,
+        world_id: str,
+        actor_id: str,
+        steps: Sequence[IntentStep],
+        *,
+        request_id: str,
+        start_index: int,
+    ) -> tuple[WorldEvent, ...]:
+        if not steps:
+            return ()
+        state = self.kernel.state(world_id)
+        proposals = tuple(
+            self._proposal_for_turn_step(
+                world_id=world_id,
+                actor_id=actor_id,
+                step=step,
+                observed_seq=state.seq + offset,
+                request_id=request_id,
+                index=start_index + offset,
+            )
+            for offset, step in enumerate(steps)
+        )
+        committed = self.kernel.submit_many(
+            world_id, proposals, expected_seq=state.seq
+        )
+        before = state
+        for event in committed:
+            after = reduce_event(before, event)
+            self._derive_cognition(world_id, event, before, after)
+            before = after
+        return committed
+
+    def _commit_turn_steps(
+        self,
+        world_id: str,
+        actor_id: str,
+        steps: Sequence[IntentStep],
+        *,
+        request_id: str,
+    ) -> tuple[WorldEvent, ...]:
+        committed: list[WorldEvent] = []
+        pending: list[IntentStep] = []
+        pending_start = 0
+
+        def flush() -> None:
+            nonlocal pending, pending_start
+            if not pending:
+                return
+            committed.extend(
+                self._commit_kernel_steps(
+                    world_id,
+                    actor_id,
+                    pending,
+                    request_id=request_id,
+                    start_index=pending_start,
+                )
+            )
+            pending = []
+
+        for index, step in enumerate(steps):
+            if step.action_type == ACTION_EXPLORE:
+                flush()
+                payload = dict(step.parameters)
+                _require_exact_keys(payload, {"target_id", "aspect"})
+                committed.extend(self._explore(world_id, actor_id, payload))
+                pending_start = index + 1
+                continue
+            if not pending:
+                pending_start = index
+            pending.append(step)
+        flush()
+        return tuple(committed)
+
+    def perform_turn(
+        self,
+        participant: Participant,
+        world_id: str,
+        text: str,
+        *,
+        observed_seq: int,
+        request_id: str,
+    ) -> TurnResult:
+        actor_id = self._membership(participant, world_id)
+        cleaned = _clean_text(text, "你想做的事", maximum=1000)
+        request_id = _clean_text(request_id, "request_id", maximum=128)
+        with self._advance_lock:
+            initial = self.kernel.state(world_id)
+            if int(observed_seq) != initial.seq:
+                from world.event_store import ConcurrencyConflict
+
+                raise ConcurrencyConflict(world_id, int(observed_seq), initial.seq)
+            context = self._player_intent_context(initial, actor_id)
+            steps = self._interpret_turn(cleaned, context)
+            player_events = self._commit_turn_steps(
+                world_id,
+                actor_id,
+                steps,
+                request_id=request_id,
+            )
+            responses = self._advance_locked(world_id)
+            if responses.events:
+                message = "事情继续发生了，周围也有了回应。"
+            elif player_events:
+                message = "这件事已经成为这里刚刚发生的一部分。"
+            else:
+                message = "你停下来留意了一会儿。"
+            view = self.observer_view(participant, world_id)
+            return TurnResult(player_events, responses.events, message, view)
 
     def _latent_value_factory(
         self, determinism_key: str, context: Mapping[str, Any]
@@ -499,6 +751,31 @@ class WorldService:
                     self._persist_update(world_id, update)
             return
 
+        if event.event_type == ACTIVITY_PERFORMED:
+            actor_id = str(event.payload["actor_id"])
+            location_id = event.payload["location_id"]
+            targets = set(event.payload["target_ids"])
+            for observer in agents:
+                if (
+                    observer.id == actor_id
+                    or observer.location_id == location_id
+                    or observer.id in targets
+                ):
+                    self._derive_for_observer(
+                        world_id,
+                        event,
+                        observer.id,
+                        {
+                            "kind": "activity",
+                            "actor_id": actor_id,
+                            "description": event.payload["description"],
+                            "target_ids": event.payload["target_ids"],
+                            "location_id": location_id,
+                        },
+                        salience=0.6,
+                    )
+            return
+
         if event.event_type == WISH_SUBMITTED:
             # The wish pool is a declared public communication surface, so all
             # agents receive the text without receiving the submitter's
@@ -554,7 +831,16 @@ class WorldService:
         nearby = [
             {"id": entity.id, "name": entity.name, "kind": entity.kind}
             for entity in state.entities.values()
-            if entity.location_id == observer.location_id and entity.kind not in {"latent_fact"}
+            if entity.location_id == observer.location_id
+            and entity.kind
+            not in {
+                "activity",
+                "capability",
+                "goal",
+                "latent_fact",
+                "utterance",
+                "wish",
+            }
         ]
         return {
             "self": {
@@ -564,6 +850,15 @@ class WorldService:
                 "location_id": observer.location_id,
             },
             "nearby": nearby,
+            "locations": [
+                {
+                    "id": entity.id,
+                    "name": entity.name,
+                    "description": str(entity.attributes.get("description", "")),
+                }
+                for entity in state.entities.values()
+                if entity.kind == "place"
+            ],
             "seq": state.seq,
         }
 
@@ -708,7 +1003,12 @@ class WorldService:
             available_actions = (
                 (ACTION_SELECT_CHILD_GOAL,)
                 if controller_type == "child_selector"
-                else (ACTION_UTTER_SPEECH,)
+                else (
+                    ACTION_MOVE_ENTITY,
+                    ACTION_PERFORM_ACTIVITY,
+                    ACTION_SUBMIT_WISH,
+                    ACTION_UTTER_SPEECH,
+                )
             )
             context = DecisionContext(
                 agent_id=entity_id,
@@ -818,7 +1118,15 @@ class WorldService:
                 entity.id == observer.location_id
                 or entity.location_id == observer.location_id
             )
-            and entity.kind not in {"utterance", "wish", "goal", "capability", "latent_fact"}
+            and entity.kind
+            not in {
+                "activity",
+                "utterance",
+                "wish",
+                "goal",
+                "capability",
+                "latent_fact",
+            }
         ]
 
         child = state.entity(CHILD["entity_id"])
@@ -877,6 +1185,13 @@ class WorldService:
             speaker = self._name(state, details.get("speaker_id"))
             summary = f"{speaker}说了一句话。"
             detail = f"“{details.get('utterance', '')}”"
+        elif kind == "activity":
+            actor_name = self._name(state, details.get("actor_id"))
+            if str(details.get("actor_id")) == observer_id:
+                summary = "你做了刚才想做的事。"
+            else:
+                summary = f"{actor_name}在这里做了一件事。"
+            detail = str(details.get("description", ""))
         elif kind == "movement":
             actor_name = self._name(state, details.get("actor_id"))
             destination = self._name(state, details.get("to_location_id"))

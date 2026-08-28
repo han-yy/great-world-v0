@@ -8,7 +8,12 @@ from app.runtime import NOTICE_VERSION
 from app.service import WorldService
 from world.controllers import ActionIntent, ControllerUnavailable, DecisionContext
 from world.event_store import ConcurrencyConflict
-from world.kernel import ACTION_UTTER_SPEECH
+from world.kernel import (
+    ACTION_MOVE_ENTITY,
+    ACTION_PERFORM_ACTIVITY,
+    ACTION_SUBMIT_WISH,
+    ACTION_UTTER_SPEECH,
+)
 
 
 class RecordingPolicy:
@@ -74,7 +79,15 @@ class ServiceLLMTests(unittest.TestCase):
         self.assertEqual(1, len(policy.contexts))
         self.assertEqual(1, len(first.events))
         seen = policy.contexts[0]
-        self.assertEqual((ACTION_UTTER_SPEECH,), seen.available_actions)
+        self.assertEqual(
+            (
+                ACTION_MOVE_ENTITY,
+                ACTION_PERFORM_ACTIVITY,
+                ACTION_SUBMIT_WISH,
+                ACTION_UTTER_SPEECH,
+            ),
+            seen.available_actions,
+        )
         self.assertTrue(seen.beliefs)
         self.assertTrue(seen.memories)
         self.assertTrue(all(item.holder_id == "resident:linqiao" for item in seen.beliefs))
