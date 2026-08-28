@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.runtime import NOTICE_VERSION
+from app.scenario import DEFAULT_SOCIAL_LOCATION_ID
 from app.service import WorldService
 from world.controllers import ActionIntent, ControllerUnavailable, DecisionContext
 from world.event_store import ConcurrencyConflict
@@ -60,13 +61,13 @@ class ServiceLLMTests(unittest.TestCase):
             participant,
             world_id,
             "move",
-            {"destination_id": "place:cafe"},
+            {"destination_id": DEFAULT_SOCIAL_LOCATION_ID},
         )
         service.submit_action(
             participant,
             world_id,
             "speak",
-            {"text": "这里刚刚开业吗？"},
+            {"text": "今天的工友套餐是什么？"},
         )
         return service, participant, world_id
 

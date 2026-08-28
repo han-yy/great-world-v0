@@ -22,14 +22,22 @@ from app.intents import (
 from app.runtime import Participant, RuntimeStore
 from app.scenario import (
     ALL_ENTITIES,
+    ARRIVAL_DETAIL,
+    ARRIVAL_SUMMARY,
     BOOTSTRAP_HEAD_SEQ,
     CAPABILITY_LABELS,
     CHILD,
     CONTROLLER_BINDINGS,
+    FUTURE_MODE,
+    INITIAL_STATE_MODE,
+    LATENT_RULE_VERSION,
     LATENT_ASPECTS,
     PLAYER_SLOTS,
+    RULES_VERSION,
     SCENARIO_ID,
     SCENARIO_NAME,
+    SCENARIO_THEME,
+    STARTING_LOCATION_ID,
 )
 from world.child import Wish, select_child_goal
 from world.controllers import (
@@ -93,6 +101,11 @@ class ArchivedWorldError(RuntimeError):
 
 
 logger = logging.getLogger(__name__)
+
+# Worlds created before scenario metadata recorded their bootstrap boundary
+# used 21 initial events. Keeping that value here makes archived v0 epochs
+# render their original tick numbers after the scenario reset.
+LEGACY_BOOTSTRAP_HEAD_SEQ = 21
 
 
 @dataclass(frozen=True)
@@ -194,7 +207,14 @@ class WorldService:
             world_id,
             seed=seed,
             name=SCENARIO_NAME,
-            metadata={"scenario": SCENARIO_ID, "rules_version": "v0.1"},
+            metadata={
+                "scenario": SCENARIO_ID,
+                "scenario_theme": SCENARIO_THEME,
+                "initial_state_mode": INITIAL_STATE_MODE,
+                "future_mode": FUTURE_MODE,
+                "rules_version": RULES_VERSION,
+                "bootstrap_head_seq": BOOTSTRAP_HEAD_SEQ,
+            },
         )
         for raw in ALL_ENTITIES:
             excluded = {
@@ -304,7 +324,9 @@ class WorldService:
             observer_id,
             projection=lambda _event, _observer: {
                 "kind": "arrival",
-                "location_id": "place:atrium",
+                "location_id": STARTING_LOCATION_ID,
+                "summary": ARRIVAL_SUMMARY,
+                "detail": ARRIVAL_DETAIL,
             },
             salience=0.9,
         )
@@ -627,7 +649,7 @@ class WorldService:
             "target_id": parameters["target_id"],
             "aspect": aspect,
             "description": selected,
-            "rule_version": "community-mall-latent-v1",
+            "rule_version": LATENT_RULE_VERSION,
         }
 
     def _existing_latent(self, state: WorldState, key: str, scope: str) -> Entity | None:
@@ -657,6 +679,8 @@ class WorldService:
         target = state_before.entities.get(target_id)
         if target is None:
             raise ValueError("探索对象不存在。")
+        if target.kind not in {"place", "object"}:
+            raise ValueError("人的过去不会由隐藏规则生成；请通过相处和交谈了解对方。")
         visible = target.id == actor.location_id or target.location_id == actor.location_id
         if not visible:
             raise AuthorizationError("这个对象不在你的可观察范围内。")
@@ -675,7 +699,7 @@ class WorldService:
                 parameters={
                     "target_id": target_id,
                     "aspect": aspect,
-                    "rule_version": "community-mall-latent-v1",
+                    "rule_version": LATENT_RULE_VERSION,
                 },
             )
             resolver = LatentRealityResolver(
@@ -1111,12 +1135,13 @@ class WorldService:
         self._require_active_world(world_id)
         self._membership(participant, world_id)
         child_world_id = f"world_{uuid.uuid4().hex}"
+        source_record = self.events.get_world(world_id)
         self.kernel.fork_world(
             world_id,
             child_world_id,
             int(at_seq),
-            name=f"{self.events.get_world(world_id).name} · 分支",
-            metadata={"scenario": SCENARIO_ID, "rules_version": "v0.1"},
+            name=f"{source_record.name} · 分支",
+            metadata=thaw(source_record.metadata),
         )
         self.runtime.copy_membership(participant.participant_id, world_id, child_world_id)
         self.epistemic.copy_prefix(world_id, child_world_id, through_seq=int(at_seq))
@@ -1132,12 +1157,24 @@ class WorldService:
             )
         return child_world_id
 
+    def _bootstrap_head_seq(self, world_id: str) -> int:
+        """Read the epoch's own time origin instead of today's scenario."""
+
+        metadata = self.events.get_world(world_id).metadata
+        raw = metadata.get("bootstrap_head_seq", LEGACY_BOOTSTRAP_HEAD_SEQ)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return LEGACY_BOOTSTRAP_HEAD_SEQ
+        return value if value >= 1 else LEGACY_BOOTSTRAP_HEAD_SEQ
+
     def observer_view(self, participant: Participant, world_id: str) -> dict[str, Any]:
         observer_id = self._membership(participant, world_id)
         state = self.kernel.state(world_id)
         observer = state.entity(observer_id)
         world_record = self.events.get_world(world_id)
         epoch = self.runtime.world_epoch(world_id)
+        bootstrap_head_seq = self._bootstrap_head_seq(world_id)
 
         locations = [entity for entity in state.entities.values() if entity.kind == "place"]
         location_payloads: list[dict[str, Any]] = []
@@ -1194,7 +1231,7 @@ class WorldService:
                 "id": world_id,
                 "name": state.name or world_record.name,
                 "seq": state.seq,
-                "tick": max(0, state.seq - BOOTSTRAP_HEAD_SEQ),
+                "tick": max(0, state.seq - bootstrap_head_seq),
                 "is_branch": world_record.parent_world_id is not None,
                 "is_archived": bool(epoch and epoch.status == "archived"),
                 "current_world_id": self.runtime.default_world(),
@@ -1218,7 +1255,15 @@ class WorldService:
                 {"id": wish_id, "text": str(state.entities[wish_id].attributes["text"])}
                 for wish_id in state.wish_ids
             ],
-            "experiences": [self._present_experience(item, state, observer_id) for item in experiences],
+            "experiences": [
+                self._present_experience(
+                    item,
+                    state,
+                    observer_id,
+                    bootstrap_head_seq=bootstrap_head_seq,
+                )
+                for item in experiences
+            ],
         }
 
     def observer_snapshot(self, world_id: str | None = None) -> dict[str, Any]:
@@ -1379,15 +1424,23 @@ class WorldService:
         return entity.name if entity else "某个存在"
 
     def _present_experience(
-        self, item: Mapping[str, Any], state: WorldState, observer_id: str
+        self,
+        item: Mapping[str, Any],
+        state: WorldState,
+        observer_id: str,
+        *,
+        bootstrap_head_seq: int,
     ) -> dict[str, Any]:
         details = item["details"]
         kind = details.get("kind")
         summary = "你注意到世界发生了变化。"
         detail = ""
         if kind == "arrival":
-            summary = "你来到了白榆社区商业中心。"
-            detail = "中庭的灯刚亮不久，许愿池在你面前泛着很浅的光。"
+            summary = str(details.get("summary") or "你来到了白榆社区商业中心。")
+            detail = str(
+                details.get("detail")
+                or "中庭的灯刚亮不久，许愿池在你面前泛着很浅的光。"
+            )
         elif item["perceived_type"] == "heard_speech":
             speaker = self._name(state, details.get("speaker_id"))
             summary = f"{speaker}说了一句话。"
@@ -1424,7 +1477,10 @@ class WorldService:
             detail = str(details.get("name", ""))
         return {
             "id": item["perception_id"],
-            "tick": max(0, int(item.get("source_seq") or 0) - BOOTSTRAP_HEAD_SEQ),
+            "tick": max(
+                0,
+                int(item.get("source_seq") or 0) - bootstrap_head_seq,
+            ),
             "summary": summary,
             "detail": detail,
         }

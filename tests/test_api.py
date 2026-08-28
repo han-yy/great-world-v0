@@ -9,6 +9,17 @@ from fastapi.testclient import TestClient
 
 import app.api as api_module
 from app.runtime import NOTICE_VERSION
+from app.scenario import (
+    BOOTSTRAP_HEAD_SEQ,
+    DEFAULT_SOCIAL_LOCATION_ID,
+    FUTURE_MODE,
+    INITIAL_STATE_MODE,
+    LOCATIONS,
+    SCENARIO_ID,
+    SCENARIO_NAME,
+    SCENARIO_THEME,
+    STARTING_LOCATION_ID,
+)
 from app.service import WorldService
 
 
@@ -55,7 +66,19 @@ class ApiTests(unittest.TestCase):
         view = response.json()
         serialized = json.dumps(view, ensure_ascii=False)
 
-        self.assertEqual(5, len(view["locations"]))
+        self.assertEqual(len(LOCATIONS), len(view["locations"]))
+        self.assertEqual(SCENARIO_NAME, view["world"]["name"])
+        location_names = {item["name"] for item in view["locations"]}
+        self.assertTrue(
+            {
+                "曙光家属区",
+                "厂职工医院",
+                "曙光子弟学校",
+                "千禧百货商店",
+                "蓝鲸餐厅",
+                "第二食堂",
+            }.issubset(location_names)
+        )
         self.assertEqual(3, len(view["child"]["capabilities"]))
         self.assertEqual(0, view["world"]["tick"])
         for forbidden in (
@@ -101,14 +124,17 @@ class ApiTests(unittest.TestCase):
         moved = self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=second_headers,
-            json={"type": "move", "payload": {"destination_id": "place:cafe"}},
+            json={
+                "type": "move",
+                "payload": {"destination_id": DEFAULT_SOCIAL_LOCATION_ID},
+            },
         )
         self.assertEqual(201, moved.status_code, moved.text)
 
         spoken = self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=first_headers,
-            json={"type": "speak", "payload": {"text": "只在中庭听得见"}},
+            json={"type": "speak", "payload": {"text": "只在厂前广场听得见"}},
         )
         self.assertEqual(201, spoken.status_code, spoken.text)
 
@@ -118,15 +144,15 @@ class ApiTests(unittest.TestCase):
         second_view = self.client.get(
             f"/api/worlds/{world_id}/view", headers=second_headers
         ).json()
-        self.assertIn("只在中庭听得见", json.dumps(first_view, ensure_ascii=False))
-        self.assertNotIn("只在中庭听得见", json.dumps(second_view, ensure_ascii=False))
+        self.assertIn("只在厂前广场听得见", json.dumps(first_view, ensure_ascii=False))
+        self.assertNotIn("只在厂前广场听得见", json.dumps(second_view, ensure_ascii=False))
 
     def test_wish_child_response_and_scripted_resident_response(self) -> None:
         world_id, _, headers = self.consent_and_join("甲")
         wish = self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=headers,
-            json={"type": "wish", "payload": {"text": "请帮助大家一起学习修理商场的灯。"}},
+            json={"type": "wish", "payload": {"text": "请帮助大家办一次新世纪联欢会。"}},
         )
         self.assertEqual(201, wish.status_code, wish.text)
         advanced = self.client.post(
@@ -135,17 +161,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(200, advanced.status_code, advanced.text)
         self.assertEqual(1, len(advanced.json()["event_ids"]))
         view = self.client.get(f"/api/worlds/{world_id}/view", headers=headers).json()
-        self.assertEqual("请帮助大家一起学习修理商场的灯。", view["child"]["goal"])
+        self.assertEqual("请帮助大家办一次新世纪联欢会。", view["child"]["goal"])
 
         self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=headers,
-            json={"type": "move", "payload": {"destination_id": "place:cafe"}},
+            json={
+                "type": "move",
+                "payload": {"destination_id": DEFAULT_SOCIAL_LOCATION_ID},
+            },
         )
         self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=headers,
-            json={"type": "speak", "payload": {"text": "这里刚刚开业吗？"}},
+            json={"type": "speak", "payload": {"text": "今天的工友套餐是什么？"}},
         )
         response = self.client.post(
             f"/api/worlds/{world_id}/advance", headers=headers, json={}
@@ -164,7 +193,7 @@ class ApiTests(unittest.TestCase):
             f"/api/worlds/{world_id}/turns",
             headers=headers,
             json={
-                "text": "我去折页咖啡，问问今天推荐什么？",
+                "text": "我去蓝鲸餐厅，问问今天推荐什么？",
                 "observed_seq": before["world"]["seq"],
                 "request_id": "turn-natural-0001",
             },
@@ -175,7 +204,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(2, len(result["player_event_ids"]))
         self.assertEqual(1, len(result["response_event_ids"]))
         self.assertTrue(result["feedback"])
-        self.assertEqual("place:cafe", result["view"]["self"]["location_id"])
+        self.assertEqual(
+            DEFAULT_SOCIAL_LOCATION_ID,
+            result["view"]["self"]["location_id"],
+        )
         rendered = json.dumps(result["view"]["experiences"], ensure_ascii=False)
         self.assertIn("今天推荐什么", rendered)
         self.assertIn("我听见了", rendered)
@@ -189,7 +221,7 @@ class ApiTests(unittest.TestCase):
             f"/api/worlds/{world_id}/turns",
             headers=headers,
             json={
-                "text": "我在许愿池边坐下，写下一段今天的观察。",
+                "text": "我在愿望留言台边坐下，写下一段今天的观察。",
                 "observed_seq": before["world"]["seq"],
                 "request_id": "turn-natural-0002",
             },
@@ -198,7 +230,7 @@ class ApiTests(unittest.TestCase):
         result = response.json()
         self.assertEqual(1, len(result["player_event_ids"]))
         self.assertIn(
-            "我在许愿池边坐下，写下一段今天的观察。",
+            "我在愿望留言台边坐下，写下一段今天的观察。",
             json.dumps(result["view"]["experiences"], ensure_ascii=False),
         )
         self.assertGreaterEqual(len(result["feedback"]), 1)
@@ -216,6 +248,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(200, snapshot_response.status_code, snapshot_response.text)
         snapshot = snapshot_response.json()
         self.assertEqual(world_id, snapshot["world"]["id"])
+        self.assertEqual(SCENARIO_ID, snapshot["world"]["metadata"]["scenario"])
+        self.assertEqual(
+            SCENARIO_THEME,
+            snapshot["world"]["metadata"]["scenario_theme"],
+        )
+        self.assertEqual(
+            BOOTSTRAP_HEAD_SEQ,
+            snapshot["world"]["metadata"]["bootstrap_head_seq"],
+        )
+        self.assertEqual(
+            INITIAL_STATE_MODE,
+            snapshot["world"]["metadata"]["initial_state_mode"],
+        )
+        self.assertEqual(FUTURE_MODE, snapshot["world"]["metadata"]["future_mode"])
         self.assertIn("seed", snapshot["world"])
         self.assertIn("truth", snapshot)
         self.assertIn("cognition", snapshot)
@@ -311,13 +357,19 @@ class ApiTests(unittest.TestCase):
         move = self.client.post(
             f"/api/worlds/{child_id}/actions",
             headers=headers,
-            json={"type": "move", "payload": {"destination_id": "place:cafe"}},
+            json={
+                "type": "move",
+                "payload": {"destination_id": DEFAULT_SOCIAL_LOCATION_ID},
+            },
         )
         self.assertEqual(201, move.status_code, move.text)
         parent_after = self.client.get(f"/api/worlds/{world_id}/view", headers=headers).json()
         child_after = self.client.get(f"/api/worlds/{child_id}/view", headers=headers).json()
-        self.assertEqual("place:atrium", parent_after["self"]["location_id"])
-        self.assertEqual("place:cafe", child_after["self"]["location_id"])
+        self.assertEqual(STARTING_LOCATION_ID, parent_after["self"]["location_id"])
+        self.assertEqual(
+            DEFAULT_SOCIAL_LOCATION_ID,
+            child_after["self"]["location_id"],
+        )
         self.assertEqual(parent["world"]["seq"], parent_after["world"]["seq"])
 
     def test_fork_preserves_pending_agent_experience(self) -> None:
@@ -325,7 +377,7 @@ class ApiTests(unittest.TestCase):
         wish = self.client.post(
             f"/api/worlds/{world_id}/actions",
             headers=headers,
-            json={"type": "wish", "payload": {"text": "请先观察商场的灯。"}},
+            json={"type": "wish", "payload": {"text": "请先听听换班广播。"}},
         )
         self.assertEqual(201, wish.status_code, wish.text)
         forked = self.client.post(
@@ -344,7 +396,7 @@ class ApiTests(unittest.TestCase):
         child_view = self.client.get(
             f"/api/worlds/{child_id}/view", headers=headers
         ).json()
-        self.assertEqual("请先观察商场的灯。", child_view["child"]["goal"])
+        self.assertEqual("请先听听换班广播。", child_view["child"]["goal"])
 
     def test_exploration_freezes_once_and_repeated_read_does_not_rewrite_truth(self) -> None:
         world_id, _, headers = self.consent_and_join("甲")
@@ -376,6 +428,25 @@ class ApiTests(unittest.TestCase):
             item for item in view["experiences"] if "发现了一个细节" in item["summary"]
         ]
         self.assertEqual(1, len(discoveries))
+
+    def test_latent_rules_never_generate_a_persons_hidden_past(self) -> None:
+        world_id, _, headers = self.consent_and_join("甲")
+        response = self.client.post(
+            f"/api/worlds/{world_id}/actions",
+            headers=headers,
+            json={
+                "type": "explore",
+                "payload": {"target_id": "child:one", "aspect": "history"},
+            },
+        )
+
+        self.assertEqual(400, response.status_code, response.text)
+        self.assertIn("通过相处和交谈了解", response.json()["detail"])
+        snapshot = self.client.get(
+            "/api/observer/worlds/current",
+            headers={"X-Observer-Token": api_module.OBSERVER_TOKEN},
+        ).json()
+        self.assertEqual([], snapshot["truth"]["latent_facts"])
 
 
 if __name__ == "__main__":

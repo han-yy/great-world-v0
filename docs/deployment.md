@@ -1,4 +1,4 @@
-# 大世界 v0：Railway 部署与 DeepSeek 接入
+# 大世界 v0：Railway 部署、DeepSeek 接入与未来 OpenAI 迁移
 
 这套配置面向小规模、受邀测试：一个 FastAPI 进程、一份 SQLite 数据库、一个持久卷。不要横向扩容，也不要公开传播网址；当前 v0 尚未具备面向公众的账号、限流与治理能力。
 
@@ -17,7 +17,9 @@
   -> WorldKernel 再次裁决，网页在同一次请求中看到结果
 ```
 
-模型不能读取完整世界账本、world seed、隐藏事实或其他角色的私人 cognition，也不能直接写 SQLite。规则入口是 `app/intents.py`，DeepSeek 入口是 `app/llm.py`，注入发生在 `app/api.py`，单次 `/turns` 编排与 Kernel 提交发生在 `app/service.py`。
+模型不能读取完整世界账本、world seed、隐藏事实或其他角色的私人 cognition，也不能直接写 SQLite。规则入口是 `app/intents.py`，当前 DeepSeek provider adapter 位于 `app/llm.py`，注入发生在 `app/api.py`，单次 `/turns` 编排与 Kernel 提交发生在 `app/service.py`。
+
+未来改用 OpenAI API 时，迁移范围只包括 `app/llm.py` 的 provider adapter、`app/api.py` 的配置注入和对应环境变量。新的适配器仍必须接收同样受限的 observer-scoped context，并输出同样的本地候选契约；不要修改 `WorldKernel`、事件 schema、SQLite 账本、回放规则或 perception / belief / memory 管道。这样更换模型不会变成一次世界重写。
 
 默认仅 `resident:linqiao` 使用 DeepSeek。需要扩大到更多初始居民时，把 `DEEPSEEK_AGENT_IDS` 改为逗号分隔的列表：
 
@@ -38,7 +40,7 @@ uv sync --extra dev --python 3.12
 uv run --env-file .env uvicorn app.api:app --reload
 ```
 
-4. 进入世界后直接写“我去折页咖啡，问问林乔今天推荐什么”。一次提交会完成移动、发言与相关回应；不再需要第二个推进按钮。
+4. 进入世界后直接写“我去蓝鲸餐厅，问问林乔今天推荐什么”。一次提交会完成移动、发言与相关回应；不再需要第二个推进按钮。
 
 `.env` 已被 `.gitignore` 排除。若模型超时、返回空内容、无效 JSON 或越权动作，该批次不会写入伪造事件。
 
@@ -72,8 +74,8 @@ DEEPSEEK_MAX_OUTPUT_TOKENS=300
 
 - 保持一个 replica、一个 worker；SQLite、进程内推进锁和单卷都依赖单写者部署。
 - 设置一个难猜的邀请码，只发给受邀测试者；它保护新参与者入口，但不替代生产级账号系统和限流。
-- 观察台能读取 world seed、完整事件和所有角色 cognition，必须使用独立的高强度令牌；自然语言查询在服务器本地完成，不把这份全知快照发送给 DeepSeek。
-- 观察台唯一写操作会封存当前 epoch 并以新 seed 创建新世界。重置前确认 SQLite 备份；旧账本保留且禁止继续追加事件。
+- 观察台能读取 world seed、完整事件和所有角色 cognition，必须使用独立的高强度令牌；自然语言查询在服务器本地完成，不把这份全知快照发送给任何外部模型供应商。
+- 观察台唯一写操作会封存当前 epoch 并以新 world id、新 seed 创建新世界。重置前确认 SQLite 备份；旧纪元仍可在观察台选择和查看，但旧账本禁止继续追加事件，旧 seed 与隐藏事实也不会混入新纪元。
 - DeepSeek key 只存在于本地 `.env` 或 Railway Variables；默认只允许发往 `api.deepseek.com`，自建网关必须显式开启并自行承担数据边界责任。
 - 启用外部模型后，首次进入会展示新版知情说明：玩家提交的自然语言原文和角色自己的有限上下文可能发送给模型供应商。
 - 备份卷中的 `great_world.sqlite3` 及其 WAL 相关文件；备份前停止写入或使用 SQLite 在线备份机制。

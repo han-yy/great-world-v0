@@ -5,7 +5,9 @@
 
 ## 0. 范围、术语与硬性不变量
 
-v0 的场景是刚开业的社区商业中心，默认引导数据包含约 5 个真人角色、5 个初始虚拟居民与 1 个孩子。这里的“真人角色”表示现实层可绑定真人 controller 的世界实体，不表示世界界面会公开该绑定。
+v0 的场景是仍在正常生产和生活的“千禧钢城 · 曙光钢铁联合厂”。默认引导数据包含厂区、曙光家属区、厂职工医院、曙光子弟学校、百货商店、餐厅、食堂与沿街店铺，以及约 5 个真人角色、5 个初始虚拟居民和 1 个孩子。这里的“真人角色”表示现实层可绑定真人 controller 的世界实体，不表示世界界面会公开该绑定。
+
+场景主题为“千禧梦核”，但其来源是约 2000 年前后的日常材料、设备和公共生活：马赛克、荧光灯箱、点阵屏、显像管电视、磁带、VCD、广播、换班和家属区生活。初始状态采用普通现实主义，不预置废弃钢厂、阴谋、身份谜题或超自然答案；这只约束 genesis，不限制未来走向，开放性来自参与者和居民在同一因果世界中的后续行动。world metadata 以 `initial_state_mode=ordinary-realism` 与 `future_mode=emergent-open-ended` 记录这一边界。
 
 以下不变量优先于任何界面或叙事需求：
 
@@ -37,7 +39,7 @@ v0 明确不做：3D、模型训练、向量数据库、连续意识模拟、公
 │   ├── llm.py                  # DeepSeek observer-scoped 候选适配器
 │   ├── runtime.py              # 现实层 consent / membership / delegate cursor
 │   ├── epistemic_store.py      # perception / belief / memory 的隔离持久层
-│   ├── scenario.py             # 社区商业中心实体与现实层 controller binding
+│   ├── scenario.py             # 千禧钢铁厂城实体、场景版本与现实层 controller binding
 │   ├── service.py              # observer-scoped 用例编排；不绕过 Kernel
 │   └── web/
 │       ├── index.html          # 知情同意与世界视图
@@ -247,7 +249,7 @@ WorldKernel.submit(world_id, proposal, expected_seq)
 - 每次跨层派生都附 `ProvenanceRef(source_kind, source_id, relation)`；缺来源 id 的记录拒绝形成，而不是补写一个猜测来源。
 - `knowledge` 是经证据组织的 belief/memory；`skill` 是可执行程序或熟练度；`capability` 是 Kernel 承认的行动许可。三者不得混为一个模型生成的标签。
 
-特别规则：听到 `speech.uttered("商场地下有金库")` 后，v0 只产生“说话者说过这句话”的高置信 belief；“地下有金库”最多成为低置信、待验证命题，绝不自动成为世界真相。
+特别规则：听到 `speech.uttered("明天全厂停工")` 后，v0 只产生“说话者说过这句话”的高置信 belief；“明天全厂停工”最多成为低置信、待验证命题，绝不自动成为世界真相。
 
 ### D3. 隔离验收
 
@@ -284,6 +286,8 @@ Controller.propose(context: DecisionContext) -> ActionProposal | null
 ### E3. 模型适配器
 
 v0 已实现 `DeepSeekIntentInterpreter` 与 `DeepSeekPolicy`，默认模型为 `deepseek-v4-pro`。前者把玩家的自由表达译成有序候选，后者为被相关事件唤醒的居民提出回应；两者都只接收 observer-scoped 的有限上下文。居民可以提出移动、在场活动、许愿、说话或保持沉默，玩家无法在界面上看见这些底层分类。JSON 合法不等于候选可信，服务端仍会按本地 schema 验证类型、参数、长度、角色身份、局部可达性和 `observed_seq`，最终只有 Kernel 能写入世界。
+
+模型供应商是现实运行层的可替换边界。以后接入 OpenAI API 时，只新增或替换 `app/llm.py` 中的 provider adapter，并在 `app/api.py` 注入相应配置；`DecisionContext`、`ActionProposal` 和本地验证契约保持不变。不得为了迁移供应商修改 `WorldKernel`、历史事件 schema、event store、回放规则或 perception / belief / memory 数据含义。
 
 超时、空响应、JSON 无效、越权 action 或 API 不可用时不写世界事件，也不得为了维持剧情而伪造成功。每个有界事件 batch 最多调用一次；SDK 只做一次有限重试，失败的 batch 会被消费，避免玩家反复点击形成无上限付费重试。API key 只从环境变量读取，不进数据库、事件、网页、prompt 或配置对象的字符串表示。
 
@@ -387,7 +391,7 @@ v0 使用固定规则表/有限候选域映射 hash，不用 LLM 临场编造隐
 - 旧 `POST /actions` 与 `POST /advance` 标记为 deprecated，仅供兼容；`POST /forks` 只作为受权开发/研究工具，不出现在普通玩家界面。
 - v0 不提供浏览器可用的 raw `/api/state` 或全量 ledger 端点。回放和审计先通过内核测试/本地代码完成。
 
-独立的 `/observer` 控制面由 `GREAT_WORLD_OBSERVER_TOKEN` 鉴权。它可以读取真相、信念、体验、事件、latent facts 与 capability graph，并对服务器本地快照进行自然语言只读查询；查询代码不持有写句柄，也不调用外部 LLM。唯一写端点 `/api/observer/reset` 只接受当前默认世界及精确确认短语，原子切换现实层默认指针：旧 epoch 标记为 archived，新 epoch 使用新 id 与新 seed。旧账本仍由不可变触发器保护，所有旧世界 mutation 路径返回 `world_archived`。
+独立的 `/observer` 控制面由 `GREAT_WORLD_OBSERVER_TOKEN` 鉴权。它可以读取真相、信念、体验、事件、latent facts 与 capability graph，并对服务器本地快照进行自然语言只读查询；查询代码不持有写句柄，也不调用外部 LLM。唯一写端点 `/api/observer/reset` 只接受当前默认世界及精确确认短语，原子切换现实层默认指针：旧 epoch 标记为 archived 并继续可在观察台选择和查看，新 epoch 使用新 id 与新 seed 从当前场景 genesis 启动。旧账本仍由不可变触发器保护，所有旧世界 mutation 路径返回 `world_archived`；新旧纪元不共享后续状态、latent freeze 或 cognition。
 
 开发模式也不得把 world seed、latent value、其他实体的私有 cognition 或 controller binding 放进网页响应。若未来增加管理员端点，必须与玩家 session、路由和日志明确隔离。
 
@@ -430,7 +434,7 @@ event sourcing 与删除请求冲突时，v0 不收集不必要的真实身份�
 
 - FastAPI 提供 consent、join、observer view、turns 和受控 forks；原生网页只有一个自然语言入口，一次提交会自行完成合适的世界变化、有限居民回应，并显示玩家此刻可见的结果。
 - 提供独立的只读可视化观察台与自然语言查询；唯一写操作把旧 epoch 封存并以新 seed 创建下一 epoch。
-- 启动时生成社区商业中心演示世界；无 LLM key 时使用脚本 controller。
+- 启动时生成仍在运转的千禧钢铁厂城演示世界，包含生产区、家属区、医院、学校、商店和餐饮设施；无 LLM key 时使用脚本 controller。
 - **完成定义**：新环境按 README 在 10 分钟内启动；浏览器不收到 raw state/seed/controller type；一次自然表达后能看到被 Kernel 接受的后果和本轮自然回应。
 
 ### I5. 受控小规模试玩前加固（2–3 个开发日）
@@ -441,10 +445,10 @@ event sourcing 与删除请求冲突时，v0 不收集不必要的真实身份�
 
 ### v0 总验收场景
 
-1. Alice 在咖啡店说一句话；同地且有权限的 Bob 得到 perception，远处 Carol 得不到。
+1. Alice 在蓝鲸餐厅说一句话；同地且有权限的 Bob 得到 perception，远处厂职工医院里的 Carol 得不到。
 2. Bob 相信的是“Alice 说过 X”，不是系统把 X 认定为真；该 belief 只能进入 Bob 的 memory。
 3. 玩家提交愿望；孩子依据 priors 与能力选择、暂缓或拒绝，Kernel 记录可追溯目标，不产生 PCA 聚合人格。
-4. 探索一个隐藏空间后冻结事实；随后提交相反愿望再探索，结果不变。
+4. 首次检查一个尚未观察的设备状态后冻结事实；随后提交相反愿望再检查，结果不变。
 5. 在探索前分叉：相同因果上下文得到相同 latent 结果；一个分支的移动/目标/能力不回写另一个。
 6. 真人离线且没有相关事件时，delegate 不调用模型；有人直接互动后最多提出一个候选。
 

@@ -67,7 +67,7 @@ def context(*, actions=(ACTION_UTTER_SPEECH,)) -> DecisionContext:
         perceived_type="heard_speech",
         details={
             "speaker_id": "visitor:1",
-            "utterance": "这里刚刚开业吗？",
+            "utterance": "今天的工友套餐是什么？",
             "seed": "must-not-leak",
             "policy_id": "must-not-leak",
         },
@@ -79,7 +79,7 @@ def context(*, actions=(ACTION_UTTER_SPEECH,)) -> DecisionContext:
         holder_id="resident:linqiao",
         subject_id="visitor:1",
         predicate="said",
-        object_value="这里刚刚开业吗？",
+        object_value="今天的工友套餐是什么？",
         confidence=1.0,
         provenance=provenance,
     )
@@ -104,8 +104,8 @@ def context(*, actions=(ACTION_UTTER_SPEECH,)) -> DecisionContext:
             "self": {
                 "id": "resident:linqiao",
                 "name": "林乔",
-                "description": "折页咖啡的店主",
-                "location_id": "place:cafe",
+                "description": "蓝鲸餐厅的值班经理",
+                "location_id": "place:restaurant",
                 "policy_id": "must-not-leak",
             },
             "nearby": [
@@ -128,11 +128,19 @@ def player_context() -> PlayerIntentContext:
         actor_id="visitor:1",
         observed_seq=17,
         self_name="来客一",
-        location_id="place:atrium",
-        location_name="中庭",
+        location_id="place:factory_square",
+        location_name="厂前广场",
         locations=(
-            {"id": "place:atrium", "name": "中庭", "description": "公共空间"},
-            {"id": "place:cafe", "name": "折页咖啡", "description": "一家咖啡店"},
+            {
+                "id": "place:factory_square",
+                "name": "厂前广场",
+                "description": "厂门与生活区之间的公共广场",
+            },
+            {
+                "id": "place:restaurant",
+                "name": "蓝鲸餐厅",
+                "description": "一家面向工人和居民的餐厅",
+            },
         ),
         nearby=(
             {"id": "resident:qiaoan", "name": "乔安", "kind": "resident"},
@@ -192,7 +200,7 @@ class DeepSeekPolicyTests(unittest.TestCase):
         self.assertEqual("disabled", request["extra_body"]["thinking"]["type"])
         self.assertNotIn("reasoning_effort", request)
         serialized = request["messages"][1]["content"]
-        self.assertIn("这里刚刚开业吗", serialized)
+        self.assertIn("今天的工友套餐是什么", serialized)
         for forbidden in (
             "event-secret",
             "perception-secret",
@@ -286,7 +294,7 @@ class DeepSeekIntentInterpreterTests(unittest.TestCase):
             output_text=json.dumps(
                 {
                     "steps": [
-                        {"kind": "move", "destination_id": "place:cafe"},
+                        {"kind": "move", "destination_id": "place:restaurant"},
                         {"kind": "speak", "text": "今天推荐什么？"},
                     ]
                 },
@@ -297,7 +305,7 @@ class DeepSeekIntentInterpreterTests(unittest.TestCase):
             settings(), client=FakeClient(endpoint)
         )
         steps = interpreter(
-            "我去折页咖啡，问问今天推荐什么？", player_context()
+            "我去蓝鲸餐厅，问问今天推荐什么？", player_context()
         )
 
         self.assertEqual(
@@ -305,7 +313,7 @@ class DeepSeekIntentInterpreterTests(unittest.TestCase):
             tuple(step.action_type for step in steps),
         )
         request_text = endpoint.calls[0]["messages"][1]["content"]
-        self.assertIn("我去折页咖啡", request_text)
+        self.assertIn("我去蓝鲸餐厅", request_text)
         for forbidden in ("world_seed", "controller_type", "event_hash"):
             self.assertNotIn(forbidden, request_text)
 

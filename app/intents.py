@@ -65,7 +65,11 @@ class IntentInterpreter(Protocol):
 
 _MOVE_WORDS = re.compile(r"(?:去|前往|走到|走进|来到|到|进|回到|过去|逛到)")
 _SPEECH_WORDS = re.compile(r"(?:说|问问|问|告诉|喊|叫住|打招呼|聊聊|聊)")
-_WISH_WORDS = re.compile(r"(?:许愿(?!池)|愿望|投下愿望|希望孩子|希望这个世界)")
+_WISH_WORDS = re.compile(
+    r"(?:我(?:想|要)?许愿|许个愿|愿望是|"
+    r"(?:投下|提交|留下|写下|说出)(?:一个|我的|这条)?愿望|"
+    r"希望孩子|希望这个世界)"
+)
 _EXPLORE_WORDS = re.compile(
     r"(?:^|[，。！？,\s])(?:"
     r"我(?:想|要)?(?:看看|看一看|观察|检查|寻找|找找|研究|翻看|留意)|"
@@ -103,7 +107,9 @@ class RuleBasedIntentInterpreter:
 
         if _WISH_WORDS.search(cleaned):
             wish_text = re.sub(
-                r"^.*?(?:许愿(?!池)|投下愿望|愿望是|我希望(?:孩子|这个世界)?)[:：，,\s]*",
+                r"^.*?(?:我(?:想|要)?许愿|许个愿|"
+                r"(?:投下|提交|留下|写下|说出)(?:一个|我的|这条)?愿望|"
+                r"愿望是|我希望(?:孩子|这个世界)?)[:：，,\s]*",
                 "",
                 cleaned,
                 count=1,
