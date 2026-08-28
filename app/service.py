@@ -65,6 +65,7 @@ from world.models import (
     WorldEvent,
     canonical_json,
     new_id,
+    thaw,
 )
 from world.perception import (
     BeliefRecord,
@@ -84,6 +85,13 @@ class CapacityError(RuntimeError):
     pass
 
 
+class ArchivedWorldError(RuntimeError):
+    def __init__(self, world_id: str, current_world_id: str | None) -> None:
+        self.world_id = world_id
+        self.current_world_id = current_world_id
+        super().__init__("这个世界已经封存，只能观察。")
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,7 +106,16 @@ class TurnResult:
     player_events: tuple[WorldEvent, ...]
     response_events: tuple[WorldEvent, ...]
     message: str
+    feedback: tuple[Mapping[str, Any], ...]
     view: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ResetResult:
+    archived_world_id: str
+    world_id: str
+    epoch_index: int
+    seed_changed: bool
 
 
 def _clean_text(value: Any, field_name: str, *, maximum: int = 500) -> str:
@@ -159,6 +176,7 @@ class WorldService:
         if existing is not None:
             try:
                 self.events.get_world(existing)
+                self.runtime.ensure_epoch(existing)
                 return existing
             except WorldNotFound:
                 # A stale reality-layer pointer has no authority over the
@@ -168,6 +186,7 @@ class WorldService:
         seed = uuid.uuid4().hex + uuid.uuid4().hex
         self._bootstrap_world(world_id, seed)
         self.runtime.set_default_world(world_id)
+        self.runtime.ensure_epoch(world_id)
         return world_id
 
     def _bootstrap_world(self, world_id: str, seed: str) -> None:
@@ -267,6 +286,10 @@ class WorldService:
             raise AuthorizationError("你尚未进入这个世界分支。")
         return entity_id
 
+    def _require_active_world(self, world_id: str) -> None:
+        if self.runtime.is_archived_world(world_id):
+            raise ArchivedWorldError(world_id, self.runtime.default_world())
+
     def _record_arrival_experience(self, world_id: str, observer_id: str) -> None:
         source = self.events.event_at(world_id, 1)
         wrapper = {
@@ -294,6 +317,7 @@ class WorldService:
         action_type: str,
         payload: Mapping[str, Any],
     ) -> tuple[WorldEvent, ...]:
+        self._require_active_world(world_id)
         actor_id = self._membership(participant, world_id)
         if not isinstance(payload, Mapping):
             raise ValueError("行动参数必须是对象。")
@@ -531,10 +555,17 @@ class WorldService:
         observed_seq: int,
         request_id: str,
     ) -> TurnResult:
+        self._require_active_world(world_id)
         actor_id = self._membership(participant, world_id)
         cleaned = _clean_text(text, "你想做的事", maximum=1000)
         request_id = _clean_text(request_id, "request_id", maximum=128)
         with self._advance_lock:
+            seen_experience_ids = {
+                item["perception_id"]
+                for item in self.epistemic.perceptions_for(
+                    world_id, actor_id, limit=200
+                )
+            }
             initial = self.kernel.state(world_id)
             if int(observed_seq) != initial.seq:
                 from world.event_store import ConcurrencyConflict
@@ -549,14 +580,32 @@ class WorldService:
                 request_id=request_id,
             )
             responses = self._advance_locked(world_id)
-            if responses.events:
-                message = "事情继续发生了，周围也有了回应。"
-            elif player_events:
-                message = "这件事已经成为这里刚刚发生的一部分。"
-            else:
-                message = "你停下来留意了一会儿。"
             view = self.observer_view(participant, world_id)
-            return TurnResult(player_events, responses.events, message, view)
+            feedback = tuple(
+                item
+                for item in view["experiences"]
+                if item["id"] not in seen_experience_ids
+            )[-6:]
+            if not feedback:
+                feedback = (
+                    {
+                        "id": f"turn-feedback-{request_id}",
+                        "tick": view["world"]["tick"],
+                        "summary": "你留意着眼前的结果。",
+                        "detail": "这一次没有出现新的可观察变化；这里仍保持着刚才的样子。",
+                    },
+                )
+            latest = feedback[-1]
+            message = str(latest["summary"])
+            if latest.get("detail"):
+                message += f" {latest['detail']}"
+            return TurnResult(
+                player_events,
+                responses.events,
+                message,
+                feedback,
+                view,
+            )
 
     def _latent_value_factory(
         self, determinism_key: str, context: Mapping[str, Any]
@@ -924,6 +973,7 @@ class WorldService:
         return policy
 
     def advance(self, participant: Participant, world_id: str) -> AdvanceResult:
+        self._require_active_world(world_id)
         self._membership(participant, world_id)
         # v0 runs one process and serializes bounded agent batches. Human
         # actions may still race, in which case the event store's expected-seq
@@ -1058,6 +1108,7 @@ class WorldService:
         return AdvanceResult((), "没有相关的新事件需要角色回应。")
 
     def fork(self, participant: Participant, world_id: str, at_seq: int) -> str:
+        self._require_active_world(world_id)
         self._membership(participant, world_id)
         child_world_id = f"world_{uuid.uuid4().hex}"
         self.kernel.fork_world(
@@ -1086,6 +1137,7 @@ class WorldService:
         state = self.kernel.state(world_id)
         observer = state.entity(observer_id)
         world_record = self.events.get_world(world_id)
+        epoch = self.runtime.world_epoch(world_id)
 
         locations = [entity for entity in state.entities.values() if entity.kind == "place"]
         location_payloads: list[dict[str, Any]] = []
@@ -1144,6 +1196,8 @@ class WorldService:
                 "seq": state.seq,
                 "tick": max(0, state.seq - BOOTSTRAP_HEAD_SEQ),
                 "is_branch": world_record.parent_world_id is not None,
+                "is_archived": bool(epoch and epoch.status == "archived"),
+                "current_world_id": self.runtime.default_world(),
             },
             "self": {
                 "id": observer.id,
@@ -1166,6 +1220,159 @@ class WorldService:
             ],
             "experiences": [self._present_experience(item, state, observer_id) for item in experiences],
         }
+
+    def observer_snapshot(self, world_id: str | None = None) -> dict[str, Any]:
+        """Return all three layers to the isolated, read-only control plane."""
+
+        selected_world_id = world_id or self.runtime.default_world()
+        if selected_world_id is None:
+            raise WorldNotFound("还没有可观察的世界。")
+        record = self.events.get_world(selected_world_id)
+        state = self.kernel.state(selected_world_id)
+        epoch = self.runtime.world_epoch(selected_world_id)
+        history = self.kernel.history(selected_world_id)
+
+        entities = [
+            {
+                **entity.to_payload(),
+                "is_agent": entity.is_agent,
+                "controller_binding": CONTROLLER_BINDINGS.get(entity.id),
+            }
+            for entity in state.entities.values()
+            if entity.kind
+            not in {"activity", "utterance", "wish", "goal", "capability", "latent_fact"}
+        ]
+        cognition: dict[str, Any] = {}
+        for entity in self._agents(state):
+            cognition[entity.id] = {
+                "name": entity.name,
+                "perceptions": self.epistemic.perceptions_for(
+                    selected_world_id, entity.id, limit=200
+                ),
+                "beliefs": self.epistemic.beliefs_for(
+                    selected_world_id, entity.id, limit=200
+                ),
+                "memories": self.epistemic.memories_for(
+                    selected_world_id, entity.id, limit=200
+                ),
+            }
+
+        child = state.entity(CHILD["entity_id"])
+        child_goal = state.active_goal_for(child.id)
+        capability_events = [
+            event
+            for event in history
+            if event.event_type == CAPABILITY_UNLOCKED
+            and event.payload.get("entity_id") == child.id
+        ]
+        latent_facts = [
+            {
+                "fact_id": entity.id,
+                "key": entity.attributes.get("key"),
+                "value": thaw(entity.attributes.get("value")),
+                "scope": entity.attributes.get("scope"),
+                "exploration_context_hash": entity.attributes.get(
+                    "exploration_context_hash"
+                ),
+            }
+            for entity in state.entities.values()
+            if entity.kind == "latent_fact"
+        ]
+        events = [
+            {
+                "seq": event.seq,
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "actor_id": event.actor_id,
+                "payload": thaw(event.payload),
+                "occurred_at": event.occurred_at,
+                "event_hash": event.event_hash,
+                "prev_hash": event.prev_hash,
+            }
+            for event in history[-120:]
+        ]
+        epochs = []
+        for item in self.runtime.list_epochs():
+            try:
+                item_record = self.events.get_world(item.world_id)
+                seq = self.events.head(item.world_id)
+            except WorldNotFound:
+                continue
+            epochs.append(
+                {
+                    "world_id": item.world_id,
+                    "name": item_record.name,
+                    "epoch_index": item.epoch_index,
+                    "status": item.status,
+                    "previous_world_id": item.previous_world_id,
+                    "created_at": item.created_at,
+                    "archived_at": item.archived_at,
+                    "seq": seq,
+                }
+            )
+
+        return {
+            "world": {
+                "id": selected_world_id,
+                "name": state.name or record.name,
+                "seed": state.seed,
+                "seq": state.seq,
+                "status": epoch.status if epoch else "untracked",
+                "epoch_index": epoch.epoch_index if epoch else None,
+                "previous_world_id": epoch.previous_world_id if epoch else None,
+                "created_at": record.created_at,
+                "is_default": selected_world_id == self.runtime.default_world(),
+                "chain_valid": self.events.verify_chain(selected_world_id),
+                "metadata": thaw(record.metadata),
+            },
+            "epochs": epochs,
+            "truth": {
+                "entities": entities,
+                "events": events,
+                "event_count": len(history),
+                "latent_facts": latent_facts,
+                "child": {
+                    "id": child.id,
+                    "name": child.name,
+                    "development": thaw(child.attributes.get("development", {})),
+                    "capabilities": [
+                        CAPABILITY_LABELS.get(
+                            capability_id.removeprefix("capability:"), capability_id
+                        )
+                        for capability_id in sorted(state.capabilities_for(child.id))
+                    ],
+                    "goal": (
+                        str(child_goal.attributes.get("description", ""))
+                        if child_goal
+                        else None
+                    ),
+                    "evidence_event_ids": [event.event_id for event in capability_events],
+                },
+            },
+            "cognition": cognition,
+        }
+
+    def reset_default_world(self, world_id: str) -> ResetResult:
+        """Archive the current epoch and create a new-seed root world."""
+
+        with self._advance_lock:
+            current_world_id = self.runtime.default_world()
+            if current_world_id is None:
+                raise ValueError("当前没有可以重置的世界。")
+            if current_world_id != world_id:
+                raise ValueError("默认世界已经变化，请刷新观察台后重试。")
+            self._require_active_world(world_id)
+            previous_seed = self.events.get_world(world_id).seed
+            new_world_id = f"world_{uuid.uuid4().hex}"
+            new_seed = uuid.uuid4().hex + uuid.uuid4().hex
+            self._bootstrap_world(new_world_id, new_seed)
+            epoch = self.runtime.rotate_default_world(world_id, new_world_id)
+            return ResetResult(
+                archived_world_id=world_id,
+                world_id=new_world_id,
+                epoch_index=epoch.epoch_index,
+                seed_changed=new_seed != previous_seed,
+            )
 
     def _name(self, state: WorldState, entity_id: Any) -> str:
         entity = state.entities.get(str(entity_id))

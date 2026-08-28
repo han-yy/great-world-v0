@@ -129,6 +129,17 @@ button { border: 0; border-radius: 10px; }
 .moment-footer p { margin: 0; color: var(--muted); font-size: .8rem; }
 .status { min-height: 1.2em; margin: 10px 0 0; color: var(--muted); font-size: .8rem; line-height: 1.45; }
 .error { color: var(--danger); }
+.turn-feedback {
+  margin-top: 16px;
+  padding: 15px 16px;
+  border: 1px solid #c8d6c3;
+  border-radius: 13px;
+  background: #f2f7ef;
+}
+.turn-feedback .section-note { margin-bottom: 5px; }
+.feedback-item + .feedback-item { border-top: 1px solid #d8e2d4; margin-top: 10px; padding-top: 10px; }
+.feedback-summary { margin-bottom: 3px; font-size: .92rem; font-weight: 650; }
+.feedback-detail { margin: 0; color: var(--muted); font-size: .82rem; line-height: 1.55; }
 
 .timeline { margin: 6px 0 0; padding: 0; list-style: none; }
 .timeline li { padding: 13px 0; border-top: 1px solid var(--line); }

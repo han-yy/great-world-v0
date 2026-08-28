@@ -60,6 +60,10 @@ async function enterWorld() {
 async function refreshView() {
   if (!state.worldId) return;
   const view = await api(`/api/worlds/${encodeURIComponent(state.worldId)}/view`);
+  if (view.world.is_archived && view.world.current_world_id !== state.worldId) {
+    await enterWorld();
+    return;
+  }
   state.view = view;
   render(view);
 }
@@ -152,6 +156,25 @@ function renderWishes(wishes) {
   }
 }
 
+function renderTurnFeedback(feedback) {
+  const panel = $("#turn-feedback");
+  const container = $("#turn-feedback-items");
+  container.replaceChildren();
+  for (const item of feedback || []) {
+    const block = document.createElement("div");
+    block.className = "feedback-item";
+    const summary = document.createElement("p");
+    summary.className = "feedback-summary";
+    text(summary, item.summary);
+    const detail = document.createElement("p");
+    detail.className = "feedback-detail";
+    text(detail, item.detail || "");
+    block.append(summary, detail);
+    container.append(block);
+  }
+  panel.hidden = !container.childElementCount;
+}
+
 async function submitMoment(event) {
   event.preventDefault();
   if (!state.view) return;
@@ -176,10 +199,15 @@ async function submitMoment(event) {
     input.value = "";
     state.view = result.view;
     render(result.view);
+    renderTurnFeedback(result.feedback);
     text(status, result.message || "这里继续生活了下去。");
   } catch (problem) {
     status.classList.add("error");
-    if (problem.code === "world_advanced") {
+    if (problem.code === "world_archived") {
+      await enterWorld();
+      status.classList.remove("error");
+      text(status, "旧世界已经封存。你来到了一个刚刚开始的新世界，刚才的话还留在输入框里。");
+    } else if (problem.code === "world_advanced") {
       await refreshView();
       text(status, "刚才这里又发生了些事。内容还留着，你可以再继续一次。");
     } else {

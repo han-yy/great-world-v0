@@ -16,7 +16,9 @@ class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.original_access_code = api_module.ACCESS_CODE
+        self.original_observer_token = api_module.OBSERVER_TOKEN
         api_module.ACCESS_CODE = None
+        api_module.OBSERVER_TOKEN = "observer-test-token-1234567890"
         api_module.service = WorldService(Path(self.tempdir.name) / "api.sqlite3")
         self.client_context = TestClient(api_module.app)
         self.client = self.client_context.__enter__()
@@ -24,6 +26,7 @@ class ApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
         api_module.ACCESS_CODE = self.original_access_code
+        api_module.OBSERVER_TOKEN = self.original_observer_token
         self.tempdir.cleanup()
 
     def consent_and_join(self, name: str) -> tuple[str, str, dict[str, str]]:
@@ -171,6 +174,7 @@ class ApiTests(unittest.TestCase):
         result = response.json()
         self.assertEqual(2, len(result["player_event_ids"]))
         self.assertEqual(1, len(result["response_event_ids"]))
+        self.assertTrue(result["feedback"])
         self.assertEqual("place:cafe", result["view"]["self"]["location_id"])
         rendered = json.dumps(result["view"]["experiences"], ensure_ascii=False)
         self.assertIn("今天推荐什么", rendered)
@@ -185,7 +189,7 @@ class ApiTests(unittest.TestCase):
             f"/api/worlds/{world_id}/turns",
             headers=headers,
             json={
-                "text": "我在窗边坐下，写下一段今天的观察。",
+                "text": "我在许愿池边坐下，写下一段今天的观察。",
                 "observed_seq": before["world"]["seq"],
                 "request_id": "turn-natural-0002",
             },
@@ -194,9 +198,104 @@ class ApiTests(unittest.TestCase):
         result = response.json()
         self.assertEqual(1, len(result["player_event_ids"]))
         self.assertIn(
-            "我在窗边坐下，写下一段今天的观察。",
+            "我在许愿池边坐下，写下一段今天的观察。",
             json.dumps(result["view"]["experiences"], ensure_ascii=False),
         )
+        self.assertGreaterEqual(len(result["feedback"]), 1)
+        self.assertEqual([], result["view"]["wishes"])
+
+    def test_observer_console_is_authenticated_read_only_and_layered(self) -> None:
+        world_id, _, headers = self.consent_and_join("甲")
+        observer_headers = {"X-Observer-Token": api_module.OBSERVER_TOKEN}
+
+        blocked = self.client.get("/api/observer/worlds/current")
+        self.assertEqual(401, blocked.status_code)
+        snapshot_response = self.client.get(
+            "/api/observer/worlds/current", headers=observer_headers
+        )
+        self.assertEqual(200, snapshot_response.status_code, snapshot_response.text)
+        snapshot = snapshot_response.json()
+        self.assertEqual(world_id, snapshot["world"]["id"])
+        self.assertIn("seed", snapshot["world"])
+        self.assertIn("truth", snapshot)
+        self.assertIn("cognition", snapshot)
+        self.assertTrue(snapshot["world"]["chain_valid"])
+        before_seq = snapshot["world"]["seq"]
+
+        query = self.client.post(
+            "/api/observer/query",
+            headers=observer_headers,
+            json={"question": "最近发生了什么？", "world_id": world_id},
+        )
+        self.assertEqual(200, query.status_code, query.text)
+        self.assertTrue(query.json()["read_only"])
+        after = self.client.get(
+            f"/api/observer/worlds/{world_id}", headers=observer_headers
+        ).json()
+        self.assertEqual(before_seq, after["world"]["seq"])
+
+        player_view = self.client.get(
+            f"/api/worlds/{world_id}/view", headers=headers
+        ).json()
+        self.assertNotIn("seed", player_view["world"])
+        self.assertNotIn("cognition", player_view)
+
+    def test_observer_reset_archives_old_epoch_and_uses_a_new_seed(self) -> None:
+        world_id, _, headers = self.consent_and_join("甲")
+        observer_headers = {"X-Observer-Token": api_module.OBSERVER_TOKEN}
+        old_snapshot = self.client.get(
+            "/api/observer/worlds/current", headers=observer_headers
+        ).json()
+
+        rejected = self.client.post(
+            "/api/observer/reset",
+            headers=observer_headers,
+            json={"world_id": world_id, "confirmation": "RESET wrong-world"},
+        )
+        self.assertEqual(422, rejected.status_code)
+
+        reset = self.client.post(
+            "/api/observer/reset",
+            headers=observer_headers,
+            json={
+                "world_id": world_id,
+                "confirmation": f"RESET {world_id}",
+            },
+        )
+        self.assertEqual(201, reset.status_code, reset.text)
+        result = reset.json()
+        self.assertEqual(world_id, result["archived_world_id"])
+        self.assertTrue(result["seed_changed"])
+        self.assertNotEqual(world_id, result["world_id"])
+
+        old_after = self.client.get(
+            f"/api/observer/worlds/{world_id}", headers=observer_headers
+        ).json()
+        new_snapshot = self.client.get(
+            "/api/observer/worlds/current", headers=observer_headers
+        ).json()
+        self.assertEqual("archived", old_after["world"]["status"])
+        self.assertEqual(old_snapshot["world"]["seq"], old_after["world"]["seq"])
+        self.assertNotEqual(old_snapshot["world"]["seed"], new_snapshot["world"]["seed"])
+        self.assertEqual(2, new_snapshot["world"]["epoch_index"])
+
+        old_turn = self.client.post(
+            f"/api/worlds/{world_id}/turns",
+            headers=headers,
+            json={
+                "text": "我继续留在这里。",
+                "observed_seq": old_after["world"]["seq"],
+                "request_id": "archived-turn-0001",
+            },
+        )
+        self.assertEqual(409, old_turn.status_code)
+        self.assertEqual("world_archived", old_turn.json()["code"])
+
+        rejoined = self.client.post(
+            "/api/worlds/default/join", headers=headers, json={}
+        )
+        self.assertEqual(200, rejoined.status_code, rejoined.text)
+        self.assertEqual(result["world_id"], rejoined.json()["world_id"])
 
     def test_fork_diverges_without_changing_parent(self) -> None:
         world_id, _, headers = self.consent_and_join("甲")

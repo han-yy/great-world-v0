@@ -14,8 +14,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.llm import DeepSeekIntentInterpreter, DeepSeekPolicy, DeepSeekSettings
+from app.observer import answer_observer_question
 from app.runtime import CONSENT_NOTICE, NOTICE_VERSION, Participant
-from app.service import AuthorizationError, CapacityError, WorldService
+from app.service import (
+    ArchivedWorldError,
+    AuthorizationError,
+    CapacityError,
+    WorldService,
+)
 from world.event_store import ConcurrencyConflict, EventStoreError, WorldNotFound
 from world.kernel import ProposalRejected
 
@@ -27,6 +33,9 @@ DATABASE_PATH = Path(os.environ.get("GREAT_WORLD_DB", str(DEFAULT_DB_PATH)))
 ACCESS_CODE = os.environ.get("GREAT_WORLD_ACCESS_CODE", "").strip() or None
 if ACCESS_CODE is not None and len(ACCESS_CODE) < 12:
     raise ValueError("GREAT_WORLD_ACCESS_CODE 至少需要 12 个字符。")
+OBSERVER_TOKEN = os.environ.get("GREAT_WORLD_OBSERVER_TOKEN", "").strip() or None
+if OBSERVER_TOKEN is not None and len(OBSERVER_TOKEN) < 24:
+    raise ValueError("GREAT_WORLD_OBSERVER_TOKEN 至少需要 24 个字符。")
 DEEPSEEK_SETTINGS = DeepSeekSettings.from_env()
 DEEPSEEK_POLICY = (
     DeepSeekPolicy(DEEPSEEK_SETTINGS) if DEEPSEEK_SETTINGS.enabled else None
@@ -121,6 +130,27 @@ class ForkRequest(BaseModel):
     at_seq: int = Field(ge=1)
 
 
+class ObserverQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=1000)
+    world_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("question")
+    @classmethod
+    def nonblank_question(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("观察问题不能为空。")
+        return value.strip()
+
+
+class ResetWorldRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    world_id: str = Field(min_length=8, max_length=128)
+    confirmation: str = Field(min_length=8, max_length=256)
+
+
 def participant_from_token(
     x_consent_token: str | None = Header(default=None),
 ) -> Participant:
@@ -143,6 +173,22 @@ def require_access_code(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="邀请码不正确。",
+        )
+
+
+def require_observer_token(
+    x_observer_token: str | None = Header(default=None),
+) -> None:
+    if OBSERVER_TOKEN is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="观察台尚未配置访问令牌。",
+        )
+    provided = x_observer_token or ""
+    if not secrets.compare_digest(provided, OBSERVER_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="观察台令牌不正确。",
         )
 
 
@@ -178,6 +224,18 @@ async def capacity_handler(_: Request, exc: CapacityError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc), "code": "world_full"})
 
 
+@app.exception_handler(ArchivedWorldError)
+async def archived_world_handler(_: Request, exc: ArchivedWorldError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "code": "world_archived",
+            "current_world_id": exc.current_world_id,
+        },
+    )
+
+
 @app.exception_handler(EventStoreError)
 async def event_store_handler(_: Request, exc: EventStoreError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc), "code": "event_store_error"})
@@ -191,6 +249,11 @@ async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(WEB_ROOT / "index.html")
+
+
+@app.get("/observer", include_in_schema=False)
+def observer_index() -> FileResponse:
+    return FileResponse(WEB_ROOT / "observer.html")
 
 
 @app.get("/health")
@@ -276,7 +339,58 @@ def perform_turn(
         "response_event_ids": [event.event_id for event in result.response_events],
         "seq": result.view["world"]["seq"],
         "message": result.message,
+        "feedback": list(result.feedback),
         "view": result.view,
+    }
+
+
+@app.get("/api/observer/worlds/current")
+def current_observer_snapshot(
+    _: None = Depends(require_observer_token),
+) -> dict[str, Any]:
+    return service.observer_snapshot()
+
+
+@app.get("/api/observer/worlds/{world_id}")
+def observer_snapshot(
+    world_id: str,
+    _: None = Depends(require_observer_token),
+) -> dict[str, Any]:
+    return service.observer_snapshot(world_id)
+
+
+@app.post("/api/observer/query")
+def observer_query(
+    request: ObserverQueryRequest,
+    _: None = Depends(require_observer_token),
+) -> dict[str, Any]:
+    snapshot = service.observer_snapshot(request.world_id)
+    result = answer_observer_question(snapshot, request.question)
+    return {
+        **result,
+        "world_id": snapshot["world"]["id"],
+        "world_seq": snapshot["world"]["seq"],
+    }
+
+
+@app.post("/api/observer/reset", status_code=201)
+def observer_reset(
+    request: ResetWorldRequest,
+    _: None = Depends(require_observer_token),
+) -> dict[str, Any]:
+    required = f"RESET {request.world_id}"
+    if not secrets.compare_digest(request.confirmation.strip(), required):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"请输入 {required} 以确认整世界重置。",
+        )
+    result = service.reset_default_world(request.world_id)
+    return {
+        "status": "reset",
+        "archived_world_id": result.archived_world_id,
+        "world_id": result.world_id,
+        "epoch_index": result.epoch_index,
+        "seed_changed": result.seed_changed,
     }
 
 

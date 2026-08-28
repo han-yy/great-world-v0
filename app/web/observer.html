@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>世界观察台</title>
+  <link rel="stylesheet" href="/static/observer.css">
+</head>
+<body>
+  <div class="observer-shell">
+    <header class="observer-header">
+      <div>
+        <p class="eyebrow">READ-ONLY OBSERVATORY</p>
+        <h1>世界观察台</h1>
+        <p class="subtitle">看见世界真相、个体信念与可观察体验。这里不能向世界说话，也不能改变任何局部状态。</p>
+      </div>
+      <div id="connection-state" class="connection-state">尚未连接</div>
+    </header>
+
+    <section id="observer-auth" class="auth-card">
+      <label for="observer-token">观察台令牌</label>
+      <div class="inline-form">
+        <input id="observer-token" type="password" autocomplete="off" placeholder="GREAT_WORLD_OBSERVER_TOKEN">
+        <button id="observer-connect" type="button">进入观察台</button>
+      </div>
+      <p id="auth-error" class="error" role="alert"></p>
+    </section>
+
+    <main id="observer-main" hidden>
+      <nav class="toolbar">
+        <label for="epoch-select">观察的世界</label>
+        <select id="epoch-select"></select>
+        <button id="observer-refresh" class="secondary" type="button">刷新观察</button>
+        <span id="world-status" class="status-pill"></span>
+      </nav>
+
+      <section class="metric-grid" aria-label="世界概况">
+        <article><span>Epoch</span><strong id="metric-epoch">—</strong></article>
+        <article><span>事件总数</span><strong id="metric-events">—</strong></article>
+        <article><span>实体</span><strong id="metric-entities">—</strong></article>
+        <article><span>Agent</span><strong id="metric-agents">—</strong></article>
+        <article><span>隐藏事实</span><strong id="metric-latent">—</strong></article>
+      </section>
+
+      <div class="observer-grid">
+        <section class="card map-card">
+          <div class="card-heading"><p>世界真相</p><h2>此刻各处</h2></div>
+          <div id="truth-map" class="truth-map"></div>
+        </section>
+
+        <section class="card child-card">
+          <div class="card-heading"><p>成长中的存在</p><h2>孩子</h2></div>
+          <dl id="child-truth" class="fact-list"></dl>
+        </section>
+
+        <section class="card query-card">
+          <div class="card-heading"><p>只读语言入口</p><h2>直接询问这个世界</h2></div>
+          <form id="observer-query-form">
+            <textarea id="observer-question" maxlength="1000" required placeholder="例如：林乔现在相信什么？最近发生了什么？"></textarea>
+            <button type="submit">观察</button>
+          </form>
+          <pre id="observer-answer" class="answer" aria-live="polite">所有回答都来自只读快照，不会被送回世界。</pre>
+        </section>
+
+        <section class="card cognition-card">
+          <div class="card-heading"><p>认识论分层</p><h2>某个个体所处的世界</h2></div>
+          <label for="agent-select">选择一个具有 policy 的实体</label>
+          <select id="agent-select"></select>
+          <div id="cognition-summary" class="cognition-summary"></div>
+        </section>
+
+        <section class="card events-card">
+          <div class="card-heading"><p>不可改写</p><h2>事件账本</h2></div>
+          <ol id="event-ledger" class="event-ledger"></ol>
+        </section>
+
+        <section class="card latent-card">
+          <div class="card-heading"><p>由 seed 与探索上下文冻结</p><h2>隐藏事实</h2></div>
+          <div id="latent-facts" class="latent-facts"></div>
+        </section>
+
+        <section class="card reset-card">
+          <div class="card-heading"><p>唯一写操作</p><h2>重置整个世界</h2></div>
+          <p>旧 epoch 将永久封存为只读，新世界使用新的 seed 从头开始。不会删除或改写旧账本。</p>
+          <button id="open-reset" class="danger" type="button">重置整个世界</button>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="reset-dialog">
+    <form id="reset-form" method="dialog">
+      <p class="eyebrow">IRREVERSIBLE FOR THE ACTIVE WORLD</p>
+      <h2>封存当前世界并开始新世界</h2>
+      <p>输入 <code id="reset-phrase"></code>。旧世界仍可观察，但所有参与者下一次互动时将进入新 epoch。</p>
+      <input id="reset-confirmation" autocomplete="off" required>
+      <p id="reset-error" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="cancel-reset" class="secondary" type="button">取消</button>
+        <button class="danger" type="submit">确认重置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/observer.js" defer></script>
+</body>
+</html>

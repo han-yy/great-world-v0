@@ -383,8 +383,11 @@ v0 使用固定规则表/有限候选域映射 hash，不用 LLM 临场编造隐
 - `POST /api/worlds/default/join` 建立现实 session 到世界 entity 的受保护绑定。
 - `GET /api/worlds/{world_id}/view` 只返回该 session/entity 的 observer-scoped view。
 - `POST /api/worlds/{world_id}/turns` 接收玩家的一段自然语言，绑定当前 actor，完成解释、Kernel 提交、有限回应和 observer view 返回。
+- 每个 `/turns` 响应包含至少一条 observer-scoped `feedback`；没有新事件时也明确返回“没有新的可观察变化”，但不伪造 NPC 回应。
 - 旧 `POST /actions` 与 `POST /advance` 标记为 deprecated，仅供兼容；`POST /forks` 只作为受权开发/研究工具，不出现在普通玩家界面。
 - v0 不提供浏览器可用的 raw `/api/state` 或全量 ledger 端点。回放和审计先通过内核测试/本地代码完成。
+
+独立的 `/observer` 控制面由 `GREAT_WORLD_OBSERVER_TOKEN` 鉴权。它可以读取真相、信念、体验、事件、latent facts 与 capability graph，并对服务器本地快照进行自然语言只读查询；查询代码不持有写句柄，也不调用外部 LLM。唯一写端点 `/api/observer/reset` 只接受当前默认世界及精确确认短语，原子切换现实层默认指针：旧 epoch 标记为 archived，新 epoch 使用新 id 与新 seed。旧账本仍由不可变触发器保护，所有旧世界 mutation 路径返回 `world_archived`。
 
 开发模式也不得把 world seed、latent value、其他实体的私有 cognition 或 controller binding 放进网页响应。若未来增加管理员端点，必须与玩家 session、路由和日志明确隔离。
 
@@ -426,6 +429,7 @@ event sourcing 与删除请求冲突时，v0 不收集不必要的真实身份�
 ### I4. 最低成本网页闭环（1 个开发日）
 
 - FastAPI 提供 consent、join、observer view、turns 和受控 forks；原生网页只有一个自然语言入口，一次提交会自行完成合适的世界变化、有限居民回应，并显示玩家此刻可见的结果。
+- 提供独立的只读可视化观察台与自然语言查询；唯一写操作把旧 epoch 封存并以新 seed 创建下一 epoch。
 - 启动时生成社区商业中心演示世界；无 LLM key 时使用脚本 controller。
 - **完成定义**：新环境按 README 在 10 分钟内启动；浏览器不收到 raw state/seed/controller type；一次自然表达后能看到被 Kernel 接受的后果和本轮自然回应。
 

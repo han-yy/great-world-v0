@@ -54,6 +54,7 @@ Railway 已弃用面向新服务的 `railway.toml`，因此这里使用当前支
 ```text
 GREAT_WORLD_DB=/app/data/great_world.sqlite3
 GREAT_WORLD_ACCESS_CODE=<至少12字符的随机邀请码>
+GREAT_WORLD_OBSERVER_TOKEN=<至少24字符的独立随机令牌>
 DEEPSEEK_ENABLED=true
 DEEPSEEK_API_KEY=<只粘贴到 Railway 的 secret value>
 DEEPSEEK_MODEL=deepseek-v4-pro
@@ -65,12 +66,14 @@ DEEPSEEK_TIMEOUT_SECONDS=20
 DEEPSEEK_MAX_OUTPUT_TOKENS=300
 ```
 
-5. 在 Railway Networking 中生成 HTTPS 域名。先访问 `/health`，确认得到 `{"status":"ok","version":"0.1.0"}`，再把根网址只发给受邀测试者。
+5. 在 Railway Networking 中生成 HTTPS 域名。先访问 `/health`，确认得到 `{"status":"ok","version":"0.1.0"}`，再把根网址只发给受邀测试者。项目所有者可访问 `/observer` 并输入独立观察台令牌；不要把该令牌与邀请码混用或发给参与者。
 
 ## 4. 上线边界
 
 - 保持一个 replica、一个 worker；SQLite、进程内推进锁和单卷都依赖单写者部署。
 - 设置一个难猜的邀请码，只发给受邀测试者；它保护新参与者入口，但不替代生产级账号系统和限流。
+- 观察台能读取 world seed、完整事件和所有角色 cognition，必须使用独立的高强度令牌；自然语言查询在服务器本地完成，不把这份全知快照发送给 DeepSeek。
+- 观察台唯一写操作会封存当前 epoch 并以新 seed 创建新世界。重置前确认 SQLite 备份；旧账本保留且禁止继续追加事件。
 - DeepSeek key 只存在于本地 `.env` 或 Railway Variables；默认只允许发往 `api.deepseek.com`，自建网关必须显式开启并自行承担数据边界责任。
 - 启用外部模型后，首次进入会展示新版知情说明：玩家提交的自然语言原文和角色自己的有限上下文可能发送给模型供应商。
 - 备份卷中的 `great_world.sqlite3` 及其 WAL 相关文件；备份前停止写入或使用 SQLite 在线备份机制。

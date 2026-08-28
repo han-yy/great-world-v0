@@ -51,6 +51,16 @@ class Participant:
     notice_version: str
 
 
+@dataclass(frozen=True)
+class WorldEpoch:
+    world_id: str
+    epoch_index: int
+    status: str
+    previous_world_id: str | None
+    created_at: str
+    archived_at: str | None
+
+
 class RuntimeStore:
     """Small SQLite store for consent, membership and lazy-agent cursors."""
 
@@ -95,6 +105,22 @@ class RuntimeStore:
                     entity_id TEXT NOT NULL,
                     last_seq INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (world_id, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_world_epochs (
+                    world_id TEXT PRIMARY KEY,
+                    epoch_index INTEGER NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
+                    previous_world_id TEXT,
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_world_resets (
+                    reset_id TEXT PRIMARY KEY,
+                    from_world_id TEXT NOT NULL,
+                    to_world_id TEXT NOT NULL UNIQUE,
+                    reset_at TEXT NOT NULL
                 );
                 """
             )
@@ -153,6 +179,153 @@ class RuntimeStore:
                 """,
                 (world_id,),
             )
+
+    def ensure_epoch(self, world_id: str) -> WorldEpoch:
+        """Register a pre-epoch world without changing its immutable ledger."""
+
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runtime_world_epochs WHERE world_id = ?",
+                (world_id,),
+            ).fetchone()
+            if row is None:
+                next_index = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(epoch_index), 0) + 1 FROM runtime_world_epochs"
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_world_epochs
+                        (world_id, epoch_index, status, previous_world_id,
+                         created_at, archived_at)
+                    VALUES (?, ?, 'active', NULL, ?, NULL)
+                    """,
+                    (world_id, next_index, now),
+                )
+                row = connection.execute(
+                    "SELECT * FROM runtime_world_epochs WHERE world_id = ?",
+                    (world_id,),
+                ).fetchone()
+            connection.commit()
+        return self._epoch_from_row(row)
+
+    def world_epoch(self, world_id: str) -> WorldEpoch | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_world_epochs WHERE world_id = ?",
+                (world_id,),
+            ).fetchone()
+        return self._epoch_from_row(row) if row else None
+
+    def list_epochs(self) -> tuple[WorldEpoch, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_world_epochs ORDER BY epoch_index DESC"
+            ).fetchall()
+        return tuple(self._epoch_from_row(row) for row in rows)
+
+    def is_archived_world(self, world_id: str) -> bool:
+        epoch = self.world_epoch(world_id)
+        return bool(epoch and epoch.status == "archived")
+
+    def rotate_default_world(
+        self, previous_world_id: str, new_world_id: str
+    ) -> WorldEpoch:
+        """Atomically archive one epoch and point reality sessions at a new one."""
+
+        now = _utc_now()
+        reset_id = str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT world_id FROM runtime_defaults WHERE singleton = 1"
+            ).fetchone()
+            if current is None or current["world_id"] != previous_world_id:
+                connection.rollback()
+                raise ValueError("默认世界已经变化，请刷新观察台后重试。")
+
+            previous = connection.execute(
+                "SELECT * FROM runtime_world_epochs WHERE world_id = ?",
+                (previous_world_id,),
+            ).fetchone()
+            if previous is None:
+                previous_index = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(epoch_index), 0) + 1 FROM runtime_world_epochs"
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runtime_world_epochs
+                        (world_id, epoch_index, status, previous_world_id,
+                         created_at, archived_at)
+                    VALUES (?, ?, 'active', NULL, ?, NULL)
+                    """,
+                    (previous_world_id, previous_index, now),
+                )
+            else:
+                previous_index = int(previous["epoch_index"])
+                if previous["status"] != "active":
+                    connection.rollback()
+                    raise ValueError("这个世界已经封存。")
+
+            new_index = max(
+                previous_index + 1,
+                int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(epoch_index), 0) + 1 FROM runtime_world_epochs"
+                    ).fetchone()[0]
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runtime_world_epochs
+                SET status = 'archived', archived_at = ?
+                WHERE world_id = ?
+                """,
+                (now, previous_world_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_world_epochs
+                    (world_id, epoch_index, status, previous_world_id,
+                     created_at, archived_at)
+                VALUES (?, ?, 'active', ?, ?, NULL)
+                """,
+                (new_world_id, new_index, previous_world_id, now),
+            )
+            connection.execute(
+                "UPDATE runtime_defaults SET world_id = ? WHERE singleton = 1",
+                (new_world_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_world_resets
+                    (reset_id, from_world_id, to_world_id, reset_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (reset_id, previous_world_id, new_world_id, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_world_epochs WHERE world_id = ?",
+                (new_world_id,),
+            ).fetchone()
+            connection.commit()
+        return self._epoch_from_row(row)
+
+    @staticmethod
+    def _epoch_from_row(row: sqlite3.Row) -> WorldEpoch:
+        return WorldEpoch(
+            world_id=str(row["world_id"]),
+            epoch_index=int(row["epoch_index"]),
+            status=str(row["status"]),
+            previous_world_id=row["previous_world_id"],
+            created_at=str(row["created_at"]),
+            archived_at=row["archived_at"],
+        )
 
     def default_world(self) -> str | None:
         with self._connect() as connection:
